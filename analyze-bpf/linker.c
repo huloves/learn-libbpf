@@ -5,29 +5,85 @@
 #include <stdbool.h>
 #include <string.h>
 #include <fcntl.h>
+#include <limits.h>
+#include "btf.h"
+#include "strset.h"
+#include "libbpf_internal.h"
 
 #define OPTS_VALID(opts, type)		(!(opts))
 
-struct bpf_linker {
-	char *filename;
+struct src_sec {
+	const char *sec_name;
+	/* positional (not necessarily ELF) index in an array of sections */
+	int id;
+	/* positional (not necessarily ELF) index of a matching section in a final object file */
+	int dst_id;
+	/* section data offset in a matching output section */
+	int dst_off;
+	/* whether section is omitted from the final ELF file */
+	bool skipped;
+	/* whether section is an ephemeral section, not mapped to an ELF section */
+	bool ephemeral;
+
+	/* ELF info */
+	size_t sec_idx;
+	Elf_Scn *scn;
+	Elf64_Shdr *shdr;
+	Elf_Data *data;
+
+	/* corresponding BTF DATASEC type ID */
+	int sec_type_id;
+};
+
+struct src_obj {
+	const char *filename;
 	int fd;
 	Elf *elf;
-	Elf64_Ehdr *elf_hdr;
+	/* Section header strings section index */
+	size_t shstrs_sec_idx;
+	/* SYMTAB section index */
+	size_t symtab_sec_idx;
 
-	/* Output sections metadata */
-	// struct dst_sec *secs;
-	// int sec_cnt;
+	struct btf *btf;
+	struct btf_ext *btf_ext;
 
-	// struct strset *strtab_strs; /* STRTAB unique strings */
-	// size_t strtab_sec_idx; /* STRTAB section index */
-	// size_t symtab_sec_idx; /* SYMTAB section index */
+	/* List of sections (including ephemeral). Slot zero is unused. */
+	struct src_sec *secs;
+	int sec_cnt;
 
-	// struct btf *btf;
-	// struct btf_ext *btf_ext;
+	/* mapping of symbol indices from src to dst ELF */
+	int *sym_map;
+	/* mapping from the src BTF type IDs to dst ones */
+	int *btf_type_map;
+};
 
-	/* global (including extern) ELF symbols */
-	// int glob_sym_cnt;
-	// struct glob_sym *glob_syms;
+struct btf_ext_sec_data {
+	size_t rec_cnt;
+	__u32 rec_sz;
+	void *recs;
+};
+
+struct glob_sym {
+	/* ELF symbol index */
+	int sym_idx;
+	/* associated section id for .ksyms, .kconfig, etc, but not .extern */
+	int sec_id;
+	/* extern name offset in STRTAB */
+	int name_off;
+	/* optional associated BTF type ID */
+	int btf_id;
+	/* BTF type ID to which VAR/FUNC type is pointing to; used for
+	 * rewriting types when extern VAR/FUNC is resolved to a concrete
+	 * definition
+	 */
+	int underlying_btf_id;
+	/* sec_var index in the corresponding dst_sec, if exists */
+	int var_idx;
+
+	/* extern or resolved/global symbol */
+	bool is_extern;
+	/* weak or strong symbol, never goes back from strong to weak */
+	bool is_weak;
 };
 
 struct dst_sec {
@@ -54,12 +110,34 @@ struct dst_sec {
 	/* section's DATASEC variable info, emitted on BTF finalization */
 	bool has_btf;
 	int sec_var_cnt;
-	// struct btf_var_secinfo *sec_vars;
+	struct btf_var_secinfo *sec_vars;
 
-	// /* section's .BTF.ext data */
-	// struct btf_ext_sec_data func_info;
-	// struct btf_ext_sec_data line_info;
-	// struct btf_ext_sec_data core_relo_info;
+	/* section's .BTF.ext data */
+	struct btf_ext_sec_data func_info;
+	struct btf_ext_sec_data line_info;
+	struct btf_ext_sec_data core_relo_info;
+};
+
+struct bpf_linker {
+	char *filename;
+	int fd;
+	Elf *elf;
+	Elf64_Ehdr *elf_hdr;
+
+	/* Output sections metadata */
+	struct dst_sec *secs;
+	int sec_cnt;
+
+	struct strset *strtab_strs; /* STRTAB unique strings */
+	size_t strtab_sec_idx; /* STRTAB section index */
+	size_t symtab_sec_idx; /* SYMTAB section index */
+
+	struct btf *btf;
+	struct btf_ext *btf_ext;
+
+	/* global (including extern) ELF symbols */
+	int glob_sym_cnt;
+	struct glob_sym *glob_syms;
 };
 
 static int init_output_elf(struct bpf_linker *linker, const char *file);
@@ -126,5 +204,7 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 
 	/* STRTAB */
 	/* 使用空字符串初始化strset以符合ELF */
-	// linker->strtab_strs = strset__new(INT_MAX, "", sizeof(""));
+	linker->strtab_strs = strset__new(INT_MAX, "", sizeof(""));
+
+
 }

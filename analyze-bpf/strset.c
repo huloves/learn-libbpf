@@ -5,6 +5,7 @@
 #include <limits.h>
 #include "hashmap.h"
 #include "strset.h"
+#include "libbpf_internal.h"
 
 struct strset {
 	void *strs_data;
@@ -33,7 +34,7 @@ static bool strset_equal_fn(long key1, long key2, void *ctx)
 	return strcmp(str1, str2) == 0;
 }
 
-struct strset *strset_new(size_t max_data_sz, const char *init_data, size_t init_data_sz)
+struct strset *strset__new(size_t max_data_sz, const char *init_data, size_t init_data_sz)
 {
 	struct strset *set = calloc(1, sizeof(*set));
 	struct hashmap *hash;
@@ -98,34 +99,6 @@ const char *strset__data(const struct strset *set)
 	return set->strs_data;
 }
 
-#ifndef __has_builtin
-#define __has_builtin(x) 0
-#endif
-
-/*
- * Re-implement glibc's reallocarray() for libbpf internal-only use.
- * reallocarray(), unfortunately, is not available in all versions of glibc,
- * so requires extra feature detection and using reallocarray() stub from
- * <tools/libc_compat.h> and COMPAT_NEED_REALLOCARRAY. All this complicates
- * build of libbpf unnecessarily and is just a maintenance burden. Instead,
- * it's trivial to implement libbpf-specific internal version and use it
- * throughout libbpf.
- */
-static inline void *analyze_reallocarray(void *ptr, size_t nmemb, size_t size)
-{
-	size_t total;
-
-#if __has_builtin(__builtin_mul_overflow)
-	if (unlikely(__builtin_mul_overflow(nmemb, size, &total)))
-		return NULL;
-#else
-	if (size == 0 || nmemb > ULONG_MAX / size)
-		return NULL;
-	total = nmemb * size;
-#endif
-	return realloc(ptr, total);
-}
-
 /* Ensure given dynamically allocated memory region pointed to by *data* with
  * capacity of *cap_cnt* elements each taking *elem_sz* bytes has enough
  * memory to accommodate *add_cnt* new elements, assuming *cur_cnt* elements
@@ -158,7 +131,7 @@ static void *add_mem(void **data, size_t *cap_cnt, size_t elem_sz,
 	if (new_cnt < cur_cnt + add_cnt)  /* also ensure we have enough memory */
 		new_cnt = cur_cnt + add_cnt;
 
-	new_data = analyze_reallocarray(*data, new_cnt, elem_sz);
+	new_data = libbpf_reallocarray(*data, new_cnt, elem_sz);
 	if (!new_data)
 		return NULL;
 
