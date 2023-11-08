@@ -2,7 +2,7 @@ BUILD_DIR = ./build
 INCLUDE := include
 
 OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/linker.o $(BUILD_DIR)/hashmap.o $(BUILD_DIR)/strset.o \
-	$(BUILD_DIR)/btf.o
+	$(BUILD_DIR)/btf.o $(BUILD_DIR)/libbpf.o
 
 $(BUILD_DIR)/main.o: main.c
 	gcc -I$(INCLUDE) -c -o $@ $^
@@ -17,6 +17,9 @@ $(BUILD_DIR)/strset.o: strset.c
 	gcc -I$(INCLUDE) -c -o $@ $^
 
 $(BUILD_DIR)/btf.o: btf.c
+	gcc -I$(INCLUDE) -c -o $@ $^
+
+$(BUILD_DIR)/libbpf.o: libbpf.c
 	gcc -I$(INCLUDE) -c -o $@ $^
 
 $(BUILD_DIR)/analyze-bpf: $(OBJS)

@@ -9,6 +9,7 @@
 #include "btf.h"
 #include "strset.h"
 #include "libbpf_internal.h"
+#include "libbpf_legacy.h"
 
 #define OPTS_VALID(opts, type)		(!(opts))
 
@@ -164,10 +165,59 @@ struct bpf_linker *bpf_linker__new(const char *filename, void *opts)
 	// err = init_output_elf(linker, filename);
 }
 
+static struct dst_sec *add_dst_sec(struct bpf_linker *linker, const char *sec_name)
+{
+	struct dst_sec *secs = linker->secs, *sec;
+	size_t new_cnt = linker->sec_cnt ? linker->sec_cnt + 1 : 2;
+
+	secs = libbpf_reallocarray(secs, new_cnt, sizeof(*secs));
+	if (!secs)
+		return NULL;
+
+	/* zero out newly allocated memory */
+	memset(secs + linker->sec_cnt, 0, (new_cnt - linker->sec_cnt) * sizeof(*secs));
+
+	linker->secs = secs;
+	linker->sec_cnt = new_cnt;
+
+	sec = &linker->secs[new_cnt - 1];
+	sec->id = new_cnt - 1;
+	sec->sec_name = strdup(sec_name);
+	if (!sec->sec_name)
+		return NULL;
+
+	return sec;
+}
+
+static Elf64_Sym *add_new_sym(struct bpf_linker *linker, size_t *sym_idx)
+{
+	struct dst_sec *symtab = &linker->secs[linker->symtab_sec_idx];
+	Elf64_Sym *syms, *sym;
+	size_t sym_cnt = symtab->sec_sz / sizeof(*sym);
+
+	syms = libbpf_reallocarray(symtab->raw_data, sym_cnt + 1, sizeof(*sym));
+	if (!syms)
+		return NULL;
+
+	sym = &syms[sym_cnt];
+	memset(sym, 0, sizeof(*sym));
+
+	symtab->raw_data = syms;
+	symtab->sec_sz += sizeof(*sym);
+	symtab->shdr->sh_size += sizeof(*sym);
+	symtab->data->d_size += sizeof(*sym);
+
+	if (sym_idx)
+		*sym_idx = sym_cnt;
+
+	return sym;
+}
+
 static int init_output_elf(struct bpf_linker *linker, const char *file)
 {
 	int err, str_off;
 	Elf64_Sym *init_sym;
+	struct dst_sec *sec;
 
 	linker->filename = strdup(file);
 	if (!linker->filename)
@@ -205,6 +255,104 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 	/* STRTAB */
 	/* 使用空字符串初始化strset以符合ELF */
 	linker->strtab_strs = strset__new(INT_MAX, "", sizeof(""));
+	if (libbpf_get_error(linker->strtab_strs))
+		return libbpf_get_error(linker->strtab_strs);
+	
+	sec = add_dst_sec(linker, ".strtab");
+	if (!sec)
+		return -ENOMEM;
 
+	sec->scn = elf_newscn(linker->elf);
+	if (!sec->scn) {
+		printf("failed to create STRTAB section");
+		return -EINVAL;
+	}
 
+	sec->shdr = elf64_getshdr(sec->scn);
+	if (!sec->shdr)
+		return -EINVAL;
+
+	sec->data = elf_newdata(sec->scn);
+	if (!sec->data) {
+		printf("failed to create STRTAB data");
+		return -EINVAL;
+	}
+
+	str_off = strset__add_str(linker->strtab_strs, sec->sec_name);
+	if (str_off < 0)
+		return str_off;
+	
+	sec->sec_idx = elf_ndxscn(sec->scn);
+	linker->elf_hdr->e_shstrndx = sec->sec_idx;
+	linker->strtab_sec_idx = sec->sec_idx;
+
+	sec->shdr->sh_name = str_off;
+	sec->shdr->sh_type = SHT_STRTAB;
+	sec->shdr->sh_flags = SHF_STRINGS;
+	sec->shdr->sh_offset = 0;
+	sec->shdr->sh_link = 0;
+	sec->shdr->sh_info = 0;
+	sec->shdr->sh_addralign = 1;
+	sec->shdr->sh_size = sec->sec_sz = 0;
+	sec->shdr->sh_entsize = 0;
+
+	/* SYMTAB */
+	sec = add_dst_sec(linker, ".symtab");
+	if (!sec)
+		return -ENOMEM;
+
+	sec->scn = elf_newscn(linker->elf);
+	if (!sec->scn) {
+		printf("failed to create SYMTAB section");
+		return -EINVAL;
+	}
+
+	sec->shdr = elf64_getshdr(sec->scn);
+	if (!sec->shdr)
+		return -EINVAL;
+
+	sec->data = elf_newdata(sec->scn);
+	if (!sec->data) {
+		printf("failed to create SYMTAB data");
+		return -EINVAL;
+	}
+
+	str_off = strset__add_str(linker->strtab_strs, sec->sec_name);
+	if (str_off < 0)
+		return str_off;
+
+	sec->sec_idx = elf_ndxscn(sec->scn);
+	linker->symtab_sec_idx = sec->sec_idx;
+
+	sec->shdr->sh_name = str_off;
+	sec->shdr->sh_type = SHT_SYMTAB;
+	sec->shdr->sh_flags = 0;
+	sec->shdr->sh_offset = 0;
+	sec->shdr->sh_link = linker->strtab_sec_idx;
+	/* sh_info should be one greater than the index of the last local
+	 * symbol (i.e., binding is STB_LOCAL). But why and who cares?
+	 */
+	sec->shdr->sh_info = 0;
+	sec->shdr->sh_addralign = 8;
+	sec->shdr->sh_entsize = sizeof(Elf64_Sym);
+
+	/* .BTF */
+	linker->btf = btf__new_empty();
+	err = libbpf_get_error(linker->btf);
+	if (err)
+		return err;
+
+	/* add the special all-zero symbol */
+	init_sym = add_new_sym(linker, NULL);
+	if (!init_sym)
+		return -EINVAL;
+
+	init_sym->st_name = 0;
+	init_sym->st_info = 0;
+	init_sym->st_other = 0;
+	init_sym->st_shndx = SHN_UNDEF;
+	init_sym->st_value = 0;
+	init_sym->st_size = 0;
+
+	return 0;
 }

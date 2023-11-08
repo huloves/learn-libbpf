@@ -124,4 +124,14 @@ struct btf_ext {
 	__u32 data_size;
 };
 
+/* handle pointer-returning APIs' error handling */
+static inline void *libbpf_ptr(void *ret)
+{
+	/* set errno on error, this doesn't break anything */
+	if (IS_ERR(ret))
+		errno = -PTR_ERR(ret);
+
+	return IS_ERR(ret) ? NULL : ret;
+}
+
 #endif /* _LIBBPF_INTERNAL_H */

@@ -1,7 +1,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <linux/btf.h>
+#include <linux/errno.h>
+#include <linux/err.h>
 #include "btf.h"
+#include "libbpf_internal.h"
 
 struct btf {
 	/* raw BTF data in native endianness */
@@ -97,3 +100,54 @@ struct btf {
 	/* Pointer size (in bytes) for a target architecture of this BTF */
 	int ptr_sz;
 };
+
+__u32 btf__type_cnt(const struct btf *btf)
+{
+	return btf->start_id + btf->nr_types;
+}
+
+static struct btf *btf_new_empty(struct btf *base_btf)
+{
+	struct btf *btf;
+
+	btf = calloc(1, sizeof(*btf));
+	if (!btf)
+		return ERR_PTR(-ENOMEM);
+
+	btf->nr_types = 0;
+	btf->start_id = 1;
+	btf->start_str_off = 0;
+	btf->fd = -1;
+	btf->ptr_sz = sizeof(void *);
+	btf->swapped_endian = false;
+
+	if (base_btf) {
+		btf->base_btf = base_btf;
+		btf->start_id = btf__type_cnt(base_btf);
+		btf->start_str_off = base_btf->hdr->str_len;
+	}
+
+	/* +1 for empty string at offset 0 */
+	btf->raw_size = sizeof(struct btf_header) + (base_btf ? 0 : 1);
+	btf->raw_data = calloc(1, btf->raw_size);
+	if (!btf->raw_data) {
+		free(btf);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	btf->hdr = btf->raw_data;
+	btf->hdr->hdr_len = sizeof(struct btf_header);
+	btf->hdr->magic = BTF_MAGIC;
+	btf->hdr->version = BTF_VERSION;
+
+	btf->types_data = btf->raw_data + btf->hdr->hdr_len;
+	btf->strs_data = btf->raw_data + btf->hdr->hdr_len;
+	btf->hdr->str_len = base_btf ? 0 : 1; /* empty string at offset 0 */
+
+	return btf;
+}
+
+struct btf *btf__new_empty(void)
+{
+	return libbpf_ptr(btf_new_empty(NULL));
+}
