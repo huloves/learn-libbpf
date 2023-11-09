@@ -6,8 +6,11 @@
 #include <linux/btf.h>
 #include <linux/types.h>
 
-struct btf;
+#define BTF_ELF_SEC ".BTF"
+#define BTF_EXT_ELF_SEC ".BTF.ext"
+#define MAPS_ELF_SEC ".maps"
 
+struct btf;
 
 /**
  * @brief **btf__new_empty()** creates an empty BTF object.  Use

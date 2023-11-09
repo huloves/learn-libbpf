@@ -144,6 +144,10 @@ struct bpf_linker {
 
 static int init_output_elf(struct bpf_linker *linker, const char *file);
 
+static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
+				const struct bpf_linker_file_opts *opts,
+				struct src_obj *obj);
+
 void bpf_linker__free(struct bpf_linker *linker)
 {
 	int i;
@@ -401,4 +405,212 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 	init_sym->st_size = 0;
 
 	return 0;
+}
+
+int bpf_linker__add_file(struct bpf_linker *linker, const char *filename,
+			 const struct bpf_linker_file_opts *opts)
+{
+	struct src_obj obj = {};
+	int err = 0;
+
+	if (!OPTS_VALID(opts, bpf_linker_file_opts))
+		return libbpf_err(-EINVAL);
+
+	if (!linker->elf)
+		return libbpf_err(-EINVAL);
+
+	err = err ?: linker_load_obj_file(linker, filename, opts, &obj);
+	// err = err ?: linker_append_sec_data(linker, &obj);
+	// err = err ?: linker_append_elf_syms(linker, &obj);
+	// err = err ?: linker_append_elf_relos(linker, &obj);
+	// err = err ?: linker_append_btf(linker, &obj);
+	// err = err ?: linker_append_btf_ext(linker, &obj);
+
+	return err;
+}
+
+static bool is_dwarf_sec_name(const char *name)
+{
+	/* approximation, but the actual list is too long */
+	return strncmp(name, ".debug_", sizeof(".debug_") - 1) == 0;
+}
+
+static bool is_ignored_sec(struct src_sec *sec)
+{
+	Elf64_Shdr *shdr = sec->shdr;
+	const char *name = sec->sec_name;
+
+	/* no special handling of .strtab */
+	if (shdr->sh_type == SHT_STRTAB)
+		return true;
+
+	/* ignore .llvm_addrsig section as well */
+	if (shdr->sh_type == SHT_LLVM_ADDRSIG)
+		return true;
+
+	/* no subprograms will lead to an empty .text section, ignore it */
+	if (shdr->sh_type == SHT_PROGBITS && shdr->sh_size == 0 &&
+	    strcmp(sec->sec_name, ".text") == 0)
+		return true;
+
+	/* DWARF sections */
+	if (is_dwarf_sec_name(sec->sec_name))
+		return true;
+
+	if (strncmp(name, ".rel", sizeof(".rel") - 1) == 0) {
+		name += sizeof(".rel") - 1;
+		/* DWARF section relocations */
+		if (is_dwarf_sec_name(name))
+			return true;
+
+		/* .BTF and .BTF.ext don't need relocations */
+		if (strcmp(name, BTF_ELF_SEC) == 0 ||
+		    strcmp(name, BTF_EXT_ELF_SEC) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+static struct src_sec *add_src_sec(struct src_obj *obj, const char *sec_name)
+{
+	struct src_sec *secs = obj->secs, *sec;
+	size_t new_cnt = obj->sec_cnt ? obj->sec_cnt + 1 : 2;
+
+	secs = libbpf_reallocarray(secs, new_cnt, sizeof(*secs));
+	if (!secs)
+		return NULL;
+
+	/* zero out newly allocated memory */
+	memset(secs + obj->sec_cnt, 0, (new_cnt - obj->sec_cnt) * sizeof(*secs));
+
+	obj->secs = secs;
+	obj->sec_cnt = new_cnt;
+
+	sec = &obj->secs[new_cnt - 1];
+	sec->id = new_cnt - 1;
+	sec->sec_name = sec_name;
+
+	return sec;
+}
+
+static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
+				const struct bpf_linker_file_opts *opts,
+				struct src_obj *obj)
+{
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	const int host_endianness = ELFDATA2LSB;
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	const int host_endianness = ELFDATA2MSB;
+#else
+#error "Unknown __BYTE_ORDER__"
+#endif
+	int err = 0;
+	Elf_Scn *scn;
+	Elf_Data *data;
+	Elf64_Ehdr *ehdr;
+	Elf64_Shdr *shdr;
+	struct src_sec *sec;
+
+	printf("linker: adding object file '%s'...\n", filename);
+
+	obj->filename = filename;
+
+	obj->fd = open(filename, O_RDONLY | O_CLOEXEC);
+	if (obj->fd < 0) {
+		err = -errno;
+		printf("failed to open file '%s': %d\n", filename, err);
+		return err;
+	}
+	obj->elf = elf_begin(obj->fd, ELF_C_READ_MMAP, NULL);
+	if (!obj->elf) {
+		err = -errno;
+		printf("failed to parse ELF file '%s'", filename);
+		return err;
+	}
+
+	/* Sanity check ELF file high-level properties */
+	ehdr = elf64_getehdr(obj->elf);
+	if (!ehdr) {
+		err = -errno;
+		printf("failed to get ELF header for %s", filename);
+		return err;
+	}
+	if (ehdr->e_ident[EI_DATA] != host_endianness) {
+		err = -EOPNOTSUPP;
+		printf("unsupported byte order of ELF file %s", filename);
+		return err;
+	}
+	if (ehdr->e_type != ET_REL
+	    || ehdr->e_machine != EM_BPF
+	    || ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+		err = -EOPNOTSUPP;
+		printf("unsupported kind of ELF file %s", filename);
+		return err;
+	}
+
+	if (elf_getshdrstrndx(obj->elf, &obj->shstrs_sec_idx)) {
+		err = -errno;
+		printf("failed to get SHSTRTAB section index for %s", filename);
+		return err;
+	}
+
+	scn = NULL;
+	while ((scn = elf_nextscn(obj->elf, scn)) != NULL) {
+		size_t sec_idx = elf_ndxscn(scn);
+		const char *sec_name;
+
+		shdr = elf64_getshdr(scn);
+		if (!shdr) {
+			err = -errno;
+			printf("failed to get section #%zu header for %s",
+				    sec_idx, filename);
+			return err;
+		}
+
+		sec_name = elf_strptr(obj->elf, obj->shstrs_sec_idx, shdr->sh_name);
+		if (!sec_name) {
+			err = -errno;
+			printf("failed to get section #%zu name for %s",
+				    sec_idx, filename);
+			return err;
+		}
+
+		data = elf_getdata(scn, 0);
+		if (!data) {
+			err = -errno;
+			printf("failed to get section #%zu (%s) data from %s",
+				    sec_idx, sec_name, filename);
+			return err;
+		}
+
+		sec = add_src_sec(obj, sec_name);
+		if (!sec)
+			return -ENOMEM;
+		
+		sec->scn = scn;
+		sec->shdr = shdr;
+		sec->data = data;
+		sec->sec_idx = elf_ndxscn(scn);
+
+		if (is_ignored_sec(sec)) {
+			sec->skipped = true;
+			continue;
+		}
+
+		switch (shdr->sh_type) {
+		case SHT_SYMTAB:
+			if (obj->symtab_sec_idx) {
+				err = -EOPNOTSUPP;
+				printf("multiple SYMTAB sections found, not supported\n");
+				return err;
+			}
+			obj->symtab_sec_idx = sec_idx;
+			break;
+		case SHT_STRTAB:
+			/* we'll construct our own string table */
+			break;
+		case SHT_PROGBITS:
+		}
+	}
 }

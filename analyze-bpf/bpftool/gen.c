@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <string.h>
+#include <errno.h>
 
 #include "../libbpf.h"
 
@@ -23,6 +25,17 @@ static int do_object(int argc, char **argv)
 		return -1;
 	}
 
+	while (argc) {
+		file = GET_ARG();
+
+		err = bpf_linker__add_file(linker, file, NULL);
+		if (err) {
+			printf("failed to link '%s': %s (%d)", file, strerror(errno), errno);
+			goto out;
+		}
+	}
+
+out:
 	return 0;
 }
 

@@ -10,6 +10,10 @@
 #include <unistd.h>
 #include <libelf.h>
 
+#ifndef SHT_LLVM_ADDRSIG
+#define SHT_LLVM_ADDRSIG 0x6FFF4C03
+#endif
+
 #ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
 #endif
@@ -124,6 +128,31 @@ struct btf_ext {
 	__u32 data_size;
 };
 
+/* handle direct returned errors */
+static inline int libbpf_err(int ret)
+{
+	if (ret < 0)
+		errno = -ret;
+	return ret;
+}
+
+/* handle errno-based (e.g., syscall or libc) errors according to libbpf's
+ * strict mode settings
+ */
+static inline int libbpf_err_errno(int ret)
+{
+	/* errno is already assumed to be set on error */
+	return ret < 0 ? -errno : ret;
+}
+
+/* handle error for pointer-returning APIs, err is assumed to be < 0 always */
+static inline void *libbpf_err_ptr(int err)
+{
+	/* set errno on error, this doesn't break anything */
+	errno = -err;
+	return NULL;
+}
+
 /* handle pointer-returning APIs' error handling */
 static inline void *libbpf_ptr(void *ret)
 {
@@ -132,6 +161,11 @@ static inline void *libbpf_ptr(void *ret)
 		errno = -PTR_ERR(ret);
 
 	return IS_ERR(ret) ? NULL : ret;
+}
+
+static inline bool str_is_empty(const char *s)
+{
+	return !s || !s[0];
 }
 
 #endif /* _LIBBPF_INTERNAL_H */
