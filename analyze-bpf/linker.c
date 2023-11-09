@@ -6,6 +6,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <limits.h>
+#include "libbpf.h"
 #include "btf.h"
 #include "strset.h"
 #include "libbpf_internal.h"
@@ -143,7 +144,44 @@ struct bpf_linker {
 
 static int init_output_elf(struct bpf_linker *linker, const char *file);
 
-struct bpf_linker *bpf_linker__new(const char *filename, void *opts)
+void bpf_linker__free(struct bpf_linker *linker)
+{
+	int i;
+
+	if (!linker)
+		return;
+
+	free(linker->filename);
+
+	if (linker->elf)
+		elf_end(linker->elf);
+
+	if (linker->fd >= 0)
+		close(linker->fd);
+
+	strset__free(linker->strtab_strs);
+
+	// btf__free(linker->btf);
+	// btf_ext__free(linker->btf_ext);
+
+	for (i = 1; i < linker->sec_cnt; i++) {
+		struct dst_sec *sec = &linker->secs[i];
+
+		free(sec->sec_name);
+		free(sec->raw_data);
+		free(sec->sec_vars);
+
+		free(sec->func_info.recs);
+		free(sec->line_info.recs);
+		free(sec->core_relo_info.recs);
+	}
+	free(linker->secs);
+
+	free(linker->glob_syms);
+	free(linker);
+}
+
+struct bpf_linker *bpf_linker__new(const char *filename, struct bpf_linker_opts *opts)
 {
 	struct bpf_linker *linker;
 	int err;
@@ -162,7 +200,15 @@ struct bpf_linker *bpf_linker__new(const char *filename, void *opts)
 	
 	linker->fd = -1;
 
-	// err = init_output_elf(linker, filename);
+	err = init_output_elf(linker, filename);
+	if (err)
+		goto err_out;
+
+	return linker;
+
+err_out:
+	bpf_linker__free(linker);
+	return errno = -err, NULL;
 }
 
 static struct dst_sec *add_dst_sec(struct bpf_linker *linker, const char *sec_name)
