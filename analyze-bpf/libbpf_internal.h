@@ -62,6 +62,11 @@ static inline void *libbpf_reallocarray(void *ptr, size_t nmemb, size_t size)
 	return realloc(ptr, total);
 }
 
+struct btf;
+struct btf_type;
+
+struct btf_type *btf_type_by_id(const struct btf *btf, __u32 type_id);
+
 struct btf_ext_info {
 	/*
 	 * info points to the individual info section (e.g. func_info and

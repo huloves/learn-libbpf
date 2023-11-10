@@ -185,6 +185,15 @@ void bpf_linker__free(struct bpf_linker *linker)
 	free(linker);
 }
 
+/**
+ * bpf_linker__new - 创建一个linker对象
+ * 创建一个新的linker对象
+ * 创建一个新的elf目标文件与linker对应，elf目标文件名为filename
+ * 初始化linker成员
+ * 
+ * @filename: 新建elf目标文件名
+ * @opts: linker选项，暂时不支持选项，需传入NULL
+ */
 struct bpf_linker *bpf_linker__new(const char *filename, struct bpf_linker_opts *opts)
 {
 	struct bpf_linker *linker;
@@ -198,12 +207,18 @@ struct bpf_linker *bpf_linker__new(const char *filename, struct bpf_linker_opts 
 		return errno = EINVAL, NULL;
 	}
 
+	/**
+	 * 申请一个linker对象的内存空间，calloc会将内存空间清零
+	 */
 	linker = calloc(1, sizeof(*linker));
 	if (!linker)
 		return errno = ENOMEM, NULL;
 	
 	linker->fd = -1;
 
+	/**
+	 * 初始化linker
+	 */
 	err = init_output_elf(linker, filename);
 	if (err)
 		goto err_out;
@@ -269,10 +284,16 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 	Elf64_Sym *init_sym;
 	struct dst_sec *sec;
 
+	/**
+	 * 复制文件名(file)到linker->filename
+	 */
 	linker->filename = strdup(file);
 	if (!linker->filename)
 		return -ENOMEM;
 
+	/**
+	 * 创建新文件，文件描述符记录在linker->fd
+	 */
 	linker->fd = open(file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (linker->fd < 0) {
 		err = -errno;
@@ -280,18 +301,27 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 		return err;
 	}
 
+	/**
+	 * 调用elf_begin函数创建一个elf目标文件描述符
+	 */
 	linker->elf = elf_begin(linker->fd, ELF_C_WRITE, NULL);
 	if (!linker->elf) {
 		printf("failed to create ELF object");
 		return -EINVAL;
 	}
 
+	/**
+	 * 调用elf64_newehdr函数创建一个elf header
+	 */
 	linker->elf_hdr = elf64_newehdr(linker->elf);
 	if (!linker->elf_hdr) {
 		printf("failed to create ELF header");
 		return -EINVAL;
 	}
 
+	/**
+	 * 设置elf header信息，其中e_machine为EM_BPF
+	 */
 	linker->elf_hdr->e_machine = EM_BPF;
 	linker->elf_hdr->e_type = ET_REL;
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -303,39 +333,68 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 #endif
 
 	/* STRTAB */
-	/* 使用空字符串初始化strset以符合ELF */
+	/**
+	 * 使用空字符串初始化strset以符合ELF，strset是一个字符串集合
+	 */
 	linker->strtab_strs = strset__new(INT_MAX, "", sizeof(""));
 	if (libbpf_get_error(linker->strtab_strs))
 		return libbpf_get_error(linker->strtab_strs);
-	
+
+	/**
+	 * 在linker中添加一个名为".strtab"的dst_sec（未写入文件，未创建section对象）
+	 */
 	sec = add_dst_sec(linker, ".strtab");
 	if (!sec)
 		return -ENOMEM;
 
+	/**
+	 * 调用elf_newscn()创建一个新的section对象
+	 */
 	sec->scn = elf_newscn(linker->elf);
 	if (!sec->scn) {
 		printf("failed to create STRTAB section");
 		return -EINVAL;
 	}
 
+	/**
+	 * 在sec中记录新section对象的section header
+	 */
 	sec->shdr = elf64_getshdr(sec->scn);
 	if (!sec->shdr)
 		return -EINVAL;
 
+	/**
+	 * 为新创建的section对象创建elf data，并将section data地址记录在sec->data
+	 */
 	sec->data = elf_newdata(sec->scn);
 	if (!sec->data) {
 		printf("failed to create STRTAB data");
 		return -EINVAL;
 	}
 
+	/**
+	 * 在strset中添加section name字符串
+	 */
 	str_off = strset__add_str(linker->strtab_strs, sec->sec_name);
 	if (str_off < 0)
 		return str_off;
-	
+
+	/**
+	 * sec中记录section索引
+	 */
 	sec->sec_idx = elf_ndxscn(sec->scn);
+	/**
+	 * elf header中记录string section的索引
+	 */
 	linker->elf_hdr->e_shstrndx = sec->sec_idx;
+	/**
+	 * linker中记录string section的索引
+	 */
 	linker->strtab_sec_idx = sec->sec_idx;
 
+	/**
+	 * 初始化section head
+	 */
 	sec->shdr->sh_name = str_off;
 	sec->shdr->sh_type = SHT_STRTAB;
 	sec->shdr->sh_flags = SHF_STRINGS;
@@ -387,6 +446,9 @@ static int init_output_elf(struct bpf_linker *linker, const char *file)
 	sec->shdr->sh_entsize = sizeof(Elf64_Sym);
 
 	/* .BTF */
+	/**
+	 * 创建一个空btf对象
+	 */
 	linker->btf = btf__new_empty();
 	err = libbpf_get_error(linker->btf);
 	if (err)
@@ -611,6 +673,17 @@ static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
 			/* we'll construct our own string table */
 			break;
 		case SHT_PROGBITS:
+			if (strcmp(sec_name, BTF_ELF_SEC) == 0) {
+				obj->btf = btf__new(data->d_buf, shdr->sh_size);
+				err = libbpf_get_error(obj->btf);
+				if (err) {
+					printf("failed to parse .BTF from %s: %d\n", filename, err);
+					return err;
+				}
+				sec->skipped = true;
+				continue;
+			}
+			break;
 		}
 	}
 }
