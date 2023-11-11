@@ -701,6 +701,9 @@ static struct btf *btf_new(const void *data, __u32 size, struct btf *base_btf)
 	struct btf *btf;
 	int err;
 
+	/**
+	 * 申请一个btf结构体
+	 */
 	btf = calloc(1, sizeof(struct btf));
 	if (!btf)
 		return ERR_PTR(-ENOMEM);
@@ -747,6 +750,11 @@ done:
 	return btf;
 }
 
+/** 
+ * btf__new - 根据btf data和数据大小创建一个btf对象
+ * @data: btf数据所在起始地址
+ * @size: btf数据大小
+ */
 struct btf *btf__new(const void *data, __u32 size)
 {
 	return libbpf_ptr(btf_new(data, size, NULL));

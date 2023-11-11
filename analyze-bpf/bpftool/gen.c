@@ -17,17 +17,32 @@ static int do_object(int argc, char **argv)
 		return -1;
 	}
 
+	/**
+	 * 获得输出文件名
+	 */
 	output_file = GET_ARG();
 
+	/**
+	 * 创建并初始化一个linker
+	 */
 	linker = bpf_linker__new(output_file, NULL);
 	if (!linker) {
 		printf("failed to create BPF linker instance\n");
 		return -1;
 	}
 
+	/**
+	 * 遍历每一个输入文件
+	 */
 	while (argc) {
+		/**
+		 * 获得输入文件名
+		 */
 		file = GET_ARG();
 
+		/**
+		 * 在linker中添加输入文件file中的信息
+		 */
 		err = bpf_linker__add_file(linker, file, NULL);
 		if (err) {
 			printf("failed to link '%s': %s (%d)", file, strerror(errno), errno);
