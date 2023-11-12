@@ -61,7 +61,7 @@ int main(void)
 {
 	//加载一个bpf程序
 	int prog_fd = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER, bpf_prog3, sizeof(bpf_prog3)/sizeof(bpf_prog3[0]), "GPL");
-	if(prog_fd<0){
+	if (prog_fd < 0) {
 		perror("BPF load prog");
 		exit(-1);
 	}
