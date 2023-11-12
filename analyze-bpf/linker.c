@@ -739,6 +739,16 @@ static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
 				sec->skipped = true;
 				continue;
 			}
+			if (strcmp(sec_name, BTF_EXT_ELF_SEC) == 0) {
+				// obj->btf_ext = btf_ext__new(data->d_buf, shdr->sh_size);
+				err = libbpf_get_error(obj->btf_ext);
+				if (err) {
+					printf("failed to parse .BTF.ext from '%s': %d\n", filename, err);
+					return err;
+				}
+				sec->skipped = true;
+				continue;
+			}
 			break;
 		}
 	}

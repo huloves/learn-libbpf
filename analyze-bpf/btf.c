@@ -3,12 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/btf.h>
+#include <linux/bpf.h>
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <byteswap.h>
 #include "btf.h"
 #include "libbpf_internal.h"
 #include "strset.h"
+
+// #include "/home/huloves/learn-libbpf/analyze-bpf/include/uapi/linux/bpf.h"
 
 #define BTF_MAX_NR_TYPES 0x7fffffffU
 #define BTF_MAX_STR_OFFSET 0x7fffffffU
@@ -773,4 +776,213 @@ const char *btf__str_by_offset(const struct btf *btf, __u32 offset)
 		return btf_strs_data(btf) + (offset - btf->start_str_off);
 	else
 		return errno = EINVAL, NULL;
+}
+
+struct btf_ext_sec_setup_param {
+	__u32 off;
+	__u32 len;
+	__u32 min_rec_size;
+	struct btf_ext_info *ext_info;
+	const char *desc;
+};
+
+static int btf_ext_setup_info(struct btf_ext *btf_ext,
+			      struct btf_ext_sec_setup_param *ext_sec)
+{
+	const struct btf_ext_info_sec *sinfo;
+	struct btf_ext_info *ext_info;
+	__u32 info_left, record_size;
+	size_t sec_cnt = 0;
+	/* The start of the info sec (including the __u32 record_size). */
+	void *info;
+
+	if (ext_sec->len == 0)
+		return 0;
+
+	if (ext_sec->off & 0x03) {
+		printf(".BTF.ext %s section is not aligned to 4 bytes\n",
+		     ext_sec->desc);
+		return -EINVAL;
+	}
+
+	info = btf_ext->data + btf_ext->hdr->hdr_len + ext_sec->off;
+	info_left = ext_sec->len;
+
+	if (btf_ext->data + btf_ext->data_size < info + ext_sec->len) {
+		printf("%s section (off:%u len:%u) is beyond the end of the ELF section .BTF.ext\n",
+			 ext_sec->desc, ext_sec->off, ext_sec->len);
+		return -EINVAL;
+	}
+
+	/* At least a record size */
+	if (info_left < sizeof(__u32)) {
+		printf(".BTF.ext %s record size not found\n", ext_sec->desc);
+		return -EINVAL;
+	}
+
+	/* The record size needs to meet the minimum standard */
+	record_size = *(__u32 *)info;
+	if (record_size < ext_sec->min_rec_size ||
+	    record_size & 0x03) {
+		printf("%s section in .BTF.ext has invalid record size %u\n",
+			 ext_sec->desc, record_size);
+		return -EINVAL;
+	}
+
+	sinfo = info + sizeof(__u32);
+	info_left -= sizeof(__u32);
+
+	/* If no records, return failure now so .BTF.ext won't be used. */
+	if (!info_left) {
+		printf("%s section in .BTF.ext has no records", ext_sec->desc);
+		return -EINVAL;
+	}
+
+	while (info_left) {
+		unsigned int sec_hdrlen = sizeof(struct btf_ext_info_sec);
+		__u64 total_record_size;
+		__u32 num_records;
+
+		if (info_left < sec_hdrlen) {
+			printf("%s section header is not found in .BTF.ext\n",
+			     ext_sec->desc);
+			return -EINVAL;
+		}
+
+		num_records = sinfo->num_info;
+		if (num_records == 0) {
+			printf("%s section has incorrect num_records in .BTF.ext\n",
+			     ext_sec->desc);
+			return -EINVAL;
+		}
+
+		total_record_size = sec_hdrlen + (__u64)num_records * record_size;
+		if (info_left < total_record_size) {
+			printf("%s section has incorrect num_records in .BTF.ext\n",
+			     ext_sec->desc);
+			return -EINVAL;
+		}
+
+		info_left -= total_record_size;
+		sinfo = (void *)sinfo + total_record_size;
+		sec_cnt++;
+	}
+
+	ext_info = ext_sec->ext_info;
+	ext_info->len = ext_sec->len - sizeof(__u32);
+	ext_info->rec_size = record_size;
+	ext_info->info = info + sizeof(__u32);
+	ext_info->sec_cnt = sec_cnt;
+
+	return 0;
+}
+
+static int btf_ext_setup_func_info(struct btf_ext *btf_ext)
+{
+	struct btf_ext_sec_setup_param param = {
+		.off = btf_ext->hdr->func_info_off,
+		.len = btf_ext->hdr->func_info_len,
+		.min_rec_size = sizeof(struct bpf_func_info_min),
+		.ext_info = &btf_ext->func_info,
+		.desc = "func_info"
+	};
+
+	return btf_ext_setup_info(btf_ext, &param);
+}
+
+static int btf_ext_setup_line_info(struct btf_ext *btf_ext)
+{
+	struct btf_ext_sec_setup_param param = {
+		.off = btf_ext->hdr->line_info_off,
+		.len = btf_ext->hdr->line_info_len,
+		.min_rec_size = sizeof(struct bpf_line_info_min),
+		.ext_info = &btf_ext->line_info,
+		.desc = "line_info",
+	};
+
+	return btf_ext_setup_info(btf_ext, &param);
+}
+
+static int btf_ext_setup_core_relos(struct btf_ext *btf_ext)
+{
+	struct btf_ext_sec_setup_param param = {
+		.off = btf_ext->hdr->core_relo_off,
+		.len = btf_ext->hdr->core_relo_len,
+		.min_rec_size = sizeof(struct bpf_core_relo),
+		.ext_info = &btf_ext->core_relo_info,
+		.desc = "core_relo",
+	};
+
+	return btf_ext_setup_info(btf_ext, &param);
+}
+
+static int btf_ext_parse_hdr(__u8 *data, __u32 data_size)
+{
+	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
+
+	if (data_size < offsetofend(struct btf_ext_header, hdr_len) ||
+	    data_size < hdr->hdr_len) {
+		printf("BTF.ext header not found");
+		return -EINVAL;
+	}
+
+	if (hdr->magic == bswap_16(BTF_MAGIC)) {
+		printf("BTF.ext in non-native endianness is not supported\n");
+		return -ENOTSUP;
+	} else if (hdr->magic != BTF_MAGIC) {
+		printf("Invalid BTF.ext magic:%x\n", hdr->magic);
+		return -EINVAL;
+	}
+
+	if (hdr->version != BTF_VERSION) {
+		printf("Unsupported BTF.ext version:%u\n", hdr->version);
+		return -ENOTSUP;
+	}
+
+	if (hdr->flags) {
+		printf("Unsupported BTF.ext flags:%x\n", hdr->flags);
+		return -ENOTSUP;
+	}
+
+	if (data_size == hdr->hdr_len) {
+		printf("BTF.ext has no data\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+struct btf_ext *btf_ext__new(const __u8 *data, __u32 size)
+{
+	struct btf_ext *btf_ext;
+	int err;
+
+	btf_ext = calloc(1, sizeof(struct btf_ext));
+	if (!btf_ext)
+		return libbpf_err_ptr(-ENOMEM);
+
+	btf_ext->data_size = size;
+	btf_ext->data = malloc(size);
+	if (!btf_ext->data) {
+		err = -ENOMEM;
+		goto done;
+	}
+	memcpy(btf_ext->data, data, size);
+
+	err = btf_ext_parse_hdr(btf_ext->data, size);
+	if (err)
+		goto done;
+	
+	if (btf_ext->hdr->hdr_len < offsetofend(struct btf_ext_header, line_info_len)) {
+		err = -EINVAL;
+		goto done;
+	}
+
+	err = btf_ext_setup_func_info(btf_ext);
+	if (err)
+		goto done;
+	
+
+done:
+	return NULL;
 }
