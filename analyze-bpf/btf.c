@@ -2,7 +2,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <linux/btf.h>
+// #include <linux/btf.h>
 #include <linux/bpf.h>
 #include <linux/errno.h>
 #include <linux/err.h>
@@ -11,7 +11,7 @@
 #include "libbpf_internal.h"
 #include "strset.h"
 
-// #include "/home/huloves/learn-libbpf/analyze-bpf/include/uapi/linux/bpf.h"
+#include "include/uapi/linux/bpf.h"
 
 #define BTF_MAX_NR_TYPES 0x7fffffffU
 #define BTF_MAX_STR_OFFSET 0x7fffffffU
@@ -207,6 +207,9 @@ static void btf_bswap_hdr(struct btf_header *h)
 	h->str_len = bswap_32(h->str_len);
 }
 
+/**
+ * btf_parse_hdr - 解析btf header
+ */
 static int btf_parse_hdr(struct btf *btf)
 {
 	struct btf_header *hdr = btf->hdr;
@@ -217,13 +220,22 @@ static int btf_parse_hdr(struct btf *btf)
 		return -EINVAL;
 	}
 
+	/**
+	 * 判断btf目标字节序是否与本地字节序不同
+	 */
 	if (hdr->magic == bswap_16(BTF_MAGIC)) {
+		/**
+		 * 记录目标字节序与本地字节序不同
+		 */
 		btf->swapped_endian = true;
 		if (bswap_32(hdr->hdr_len) != sizeof(struct btf_header)) {
 			printf("Can't load BTF with non-native endianness due to unsupported header length %u\n",
 				bswap_32(hdr->hdr_len));
 			return -ENOTSUP;
 		}
+		/**
+		 * 将btf头部信息的字节序转换为本地字节序
+		 */
 		btf_bswap_hdr(hdr);
 	} else if (hdr->magic != BTF_MAGIC) {
 		printf("Invalid BTF magic: %x\n", hdr->magic);
@@ -256,6 +268,9 @@ static int btf_parse_hdr(struct btf *btf)
 	return 0;
 }
 
+/**
+ * btf_parse_str_sec - 解析string section
+ */
 static int btf_parse_str_sec(struct btf *btf)
 {
 	const struct btf_header *hdr = btf->hdr;
@@ -400,6 +415,9 @@ static int btf_bswap_type_rest(struct btf_type *t)
 	}
 }
 
+/**
+ * btf_parse_type_sec - 解析type section
+ */
 static int btf_parse_type_sec(struct btf *btf)
 {
 	struct btf_header *hdr = btf->hdr;
@@ -407,10 +425,19 @@ static int btf_parse_type_sec(struct btf *btf)
 	void *end_type = next_type + hdr->type_len;
 	int err, type_size;
 
+	/**
+	 * 遍历每一个type
+	 */
 	while (next_type + sizeof(struct btf_type) <= end_type) {
+		/**
+		 * 若btf与本地字节序不同，则对btf_type进行字节序转换
+		 */
 		if (btf->swapped_endian)
 			btf_bswap_type_base(next_type);
 
+		/**
+		 * 获取type大小
+		 */
 		type_size = btf_type_size(next_type);
 		if (type_size < 0)
 			return type_size;
@@ -419,6 +446,9 @@ static int btf_parse_type_sec(struct btf *btf)
 			return -EINVAL;
 		}
 
+		/**
+		 * 若btf字节序与本地字节序不同，对剩余数据进行字节序转换
+		 */
 		if (btf->swapped_endian && btf_bswap_type_rest(next_type))
 			return -EINVAL;
 
@@ -722,6 +752,9 @@ static struct btf *btf_new(const void *data, __u32 size, struct btf *base_btf)
 		btf->start_str_off = base_btf->hdr->str_len;
 	}
 
+	/**
+	 * btf->raw_data中保存原始BTF数据，该原始BTF数据采用本机字节序
+	 */
 	btf->raw_data = malloc(size);
 	if (!btf->raw_data) {
 		err = -ENOMEM;
@@ -730,11 +763,21 @@ static struct btf *btf_new(const void *data, __u32 size, struct btf *base_btf)
 	memcpy(btf->raw_data, data, size);
 	btf->raw_size = size;
 
+	/**
+	 * When BTF is loaded from an ELF or raw memory it is stored
+	 * in a contiguous memory block.
+	 * +--------------------------------+
+	 * |  Header  |  Types  |  Strings  |
+	 * +--------------------------------+
+	 * ^
+	 * |
+	 * hdr
+	 */
 	btf->hdr = btf->raw_data;
 	err = btf_parse_hdr(btf);
 	if (err)
 		goto done;
-	
+
 	btf->strs_data = btf->raw_data + btf->hdr->hdr_len + btf->hdr->str_off;
 	btf->types_data = btf->raw_data + btf->hdr->hdr_len + btf->hdr->type_off;
 
