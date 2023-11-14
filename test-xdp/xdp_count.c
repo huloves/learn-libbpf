@@ -13,7 +13,22 @@ struct {
 	__type(value, long);
 } cnt SEC(".maps");
 
-SEC("xdp_count")
+// struct bpf_map_def {
+// 	unsigned int type;
+// 	unsigned int key_size;
+// 	unsigned int value_size;
+// 	unsigned int max_entries;
+// 	unsigned int map_flags;
+// };
+
+// struct bpf_map_def SEC("maps") cnt = {
+//         .type = BPF_MAP_TYPE_ARRAY,
+//         .key_size = sizeof(__u32),
+//         .value_size = sizeof(long),
+//         .max_entries = 2,
+// };
+
+SEC("xdp_count_btf")
 int xdp_count_prog(struct xdp_md *ctx)
 {
         void *data_end = (void *)(long)ctx->data_end;
