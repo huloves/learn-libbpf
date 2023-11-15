@@ -10,6 +10,23 @@
 #include <unistd.h>
 #include <libelf.h>
 
+#ifndef EM_BPF
+#define EM_BPF 247
+#endif
+
+#ifndef R_BPF_64_64
+#define R_BPF_64_64 1
+#endif
+#ifndef R_BPF_64_ABS64
+#define R_BPF_64_ABS64 2
+#endif
+#ifndef R_BPF_64_ABS32
+#define R_BPF_64_ABS32 3
+#endif
+#ifndef R_BPF_64_32
+#define R_BPF_64_32 10
+#endif
+
 #ifndef SHT_LLVM_ADDRSIG
 #define SHT_LLVM_ADDRSIG 0x6FFF4C03
 #endif
@@ -154,6 +171,11 @@ struct bpf_line_info_min {
 	__u32	line_col;
 };
 
+typedef int (*type_id_visit_fn)(__u32 *type_id, void *ctx);
+typedef int (*str_off_visit_fn)(__u32 *str_off, void *ctx);
+int btf_type_visit_type_ids(struct btf_type *t, type_id_visit_fn visit, void *ctx);
+int btf_type_visit_str_offs(struct btf_type *t, str_off_visit_fn visit, void *ctx);
+
 /* handle direct returned errors */
 static inline int libbpf_err(int ret)
 {
@@ -192,6 +214,11 @@ static inline void *libbpf_ptr(void *ret)
 static inline bool str_is_empty(const char *s)
 {
 	return !s || !s[0];
+}
+
+static inline bool is_pow_of_2(size_t x)
+{
+	return x && (x & (x - 1)) == 0;
 }
 
 #endif /* _LIBBPF_INTERNAL_H */

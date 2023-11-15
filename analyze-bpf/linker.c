@@ -12,6 +12,8 @@
 #include "libbpf_internal.h"
 #include "libbpf_legacy.h"
 
+#include "include/uapi/linux/bpf.h"
+
 #define OPTS_VALID(opts, type)		(!(opts))
 
 struct src_sec {
@@ -147,6 +149,10 @@ static int init_output_elf(struct bpf_linker *linker, const char *file);
 static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
 				const struct bpf_linker_file_opts *opts,
 				struct src_obj *obj);
+static int linker_sanity_check_elf(struct src_obj *obj);
+static int linker_sanity_check_elf_symtab(struct src_obj *obj, struct src_sec *sec);
+static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *sec);
+static int linker_sanity_check_btf(struct src_obj *obj);
 
 void bpf_linker__free(struct bpf_linker *linker)
 {
@@ -740,7 +746,7 @@ static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
 				continue;
 			}
 			if (strcmp(sec_name, BTF_EXT_ELF_SEC) == 0) {
-				// obj->btf_ext = btf_ext__new(data->d_buf, shdr->sh_size);
+				obj->btf_ext = btf_ext__new(data->d_buf, shdr->sh_size);
 				err = libbpf_get_error(obj->btf_ext);
 				if (err) {
 					printf("failed to parse .BTF.ext from '%s': %d\n", filename, err);
@@ -749,7 +755,286 @@ static int linker_load_obj_file(struct bpf_linker *linker, const char *filename,
 				sec->skipped = true;
 				continue;
 			}
+
+			/* data & code */
 			break;
+		case SHT_NOBITS:
+			/* BSS */
+			break;
+		case SHT_REL:
+			/* relocations */
+			break;
+		default:
+			printf("unrecognized section #%zu (%s) in %s\n",
+				sec_idx, sec_name, filename);
+			err = -EINVAL;
+			return err;
 		}
 	}
+
+	err = err ?: linker_sanity_check_elf(obj);
+	err = err ?: linker_sanity_check_btf(obj);
+	// err = err ?: linker_sanity_check_btf_ext(obj);
+	// err = err ?: linker_fixup_btf(obj);
+
+	return err;
+}
+
+static int linker_sanity_check_elf(struct src_obj *obj)
+{
+	struct src_sec *sec;
+	int i, err;
+
+	if (!obj->symtab_sec_idx) {
+		printf("ELF is missing SYMTAB section in %s\n", obj->filename);
+		return -EINVAL;
+	}
+	if (!obj->shstrs_sec_idx) {
+		printf("ELF is missing section headers STRTAB section in %s\n", obj->filename);
+		return -EINVAL;
+	}
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		sec = &obj->secs[i];
+
+		if (sec->sec_name[0] == '\0') {
+			printf("ELF section #%zu has empty name in %s\n", sec->sec_idx, obj->filename);
+			return -EINVAL;
+		}
+
+		if (sec->shdr->sh_addralign && !is_pow_of_2(sec->shdr->sh_addralign))
+			return -EINVAL;
+		if (sec->shdr->sh_addralign != sec->data->d_align)
+			return -EINVAL;
+
+		if (sec->shdr->sh_size != sec->data->d_size)
+			return -EINVAL;
+
+		switch (sec->shdr->sh_type) {
+		case SHT_SYMTAB:
+			err = linker_sanity_check_elf_symtab(obj, sec);
+			if (err)
+				return err;
+			break;
+		case SHT_STRTAB:
+			break;
+		case SHT_PROGBITS:
+			if (sec->shdr->sh_flags & SHF_EXECINSTR) {
+				if (sec->shdr->sh_size % sizeof(struct bpf_insn) != 0)
+					return -EINVAL;
+			}
+			break;
+		case SHT_NOBITS:
+			break;
+		case SHT_REL:
+			err = linker_sanity_check_elf_relos(obj, sec);
+			if (err)
+				return err;
+			break;
+		case SHT_LLVM_ADDRSIG:
+			break;
+		default:
+		printf("ELF section #%zu (%s) has unrecognized type %zu in %s\n",
+				sec->sec_idx, sec->sec_name, (size_t)sec->shdr->sh_type, obj->filename);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int linker_sanity_check_elf_symtab(struct src_obj *obj, struct src_sec *sec)
+{
+	struct src_sec *link_sec;
+	Elf64_Sym *sym;
+	int i, n;
+
+	if (sec->shdr->sh_entsize != sizeof(Elf64_Sym))
+		return -EINVAL;
+	if (sec->shdr->sh_size % sec->shdr->sh_entsize != 0)
+		return -EINVAL;
+
+	if (!sec->shdr->sh_link || sec->shdr->sh_link >= obj->sec_cnt) {
+		printf("ELF SYMTAB section #%zu points to missing STRTAB section #%zu in %s\n",
+			sec->sec_idx, (size_t)sec->shdr->sh_link, obj->filename);
+		return -EINVAL;
+	}
+	link_sec = &obj->secs[sec->shdr->sh_link];
+	if (link_sec->shdr->sh_type != SHT_STRTAB) {
+		printf("ELF SYMTAB section #%zu points to invalid STRTAB section #%zu in %s\n",
+			sec->sec_idx, (size_t)sec->shdr->sh_link, obj->filename);
+		return -EINVAL;
+	}
+
+	n = sec->shdr->sh_size / sec->shdr->sh_entsize;
+	sym = sec->data->d_buf;
+	for (i = 0; i < n; i++, sym++) {
+		int sym_type = ELF64_ST_TYPE(sym->st_info);
+		int sym_bind = ELF64_ST_BIND(sym->st_info);
+		int sym_vis = ELF64_ST_VISIBILITY(sym->st_other);
+
+		if (i == 0) {
+			if (sym->st_name != 0 || sym->st_info != 0
+			    || sym->st_other != 0 || sym->st_shndx != 0
+			    || sym->st_value != 0 || sym->st_size != 0) {
+				printf("ELF sym #0 is invalid in %s\n", obj->filename);
+				return -EINVAL;
+			}
+			continue;
+		}
+		if (sym_bind != STB_LOCAL && sym_bind != STB_GLOBAL && sym_bind != STB_WEAK) {
+			printf("ELF sym #%d in section #%zu has unsupported symbol binding %d\n",
+				i, sec->sec_idx, sym_bind);
+			return -EINVAL;
+		}
+		if (sym_vis != STV_DEFAULT && sym_vis != STV_HIDDEN) {
+			printf("ELF sym #%d in section #%zu has unsupported symbol visibility %d\n",
+				i, sec->sec_idx, sym_vis);
+			return -EINVAL;
+		}
+		if (sym->st_shndx == 0) {
+			if (sym_type != STT_NOTYPE || sym_bind == STB_LOCAL
+			    || sym->st_value != 0 || sym->st_size != 0) {
+				printf("ELF sym #%d is invalid extern symbol in %s\n",
+					i, obj->filename);
+
+				return -EINVAL;
+			}
+			continue;
+		}
+		if (sym->st_shndx < SHN_LORESERVE && sym->st_shndx >= obj->sec_cnt) {
+			printf("ELF sym #%d in section #%zu points to missing section #%zu in %s\n",
+				i, sec->sec_idx, (size_t)sym->st_shndx, obj->filename);
+			return -EINVAL;
+		}
+		if (sym_type == STT_SECTION) {
+			if (sym->st_value != 0)
+				return -EINVAL;
+			continue;
+		}
+	}
+
+	return 0;
+}
+
+static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *sec)
+{
+	struct src_sec *link_sec, *sym_sec;
+	Elf64_Rel *relo;
+	int i, n;
+
+	if (sec->shdr->sh_entsize != sizeof(Elf64_Rel))
+		return -EINVAL;
+	if (sec->shdr->sh_size % sec->shdr->sh_entsize != 0)
+		return -EINVAL;
+
+	/* SHT_REL's sh_link should point to SYMTAB */
+	if (sec->shdr->sh_link != obj->symtab_sec_idx) {
+		printf("ELF relo section #%zu points to invalid SYMTAB section #%zu in %s\n",
+			sec->sec_idx, (size_t)sec->shdr->sh_link, obj->filename);
+		return -EINVAL;
+	}
+
+	/* SHT_REL's sh_info points to relocated section */
+	if (!sec->shdr->sh_info || sec->shdr->sh_info >= obj->sec_cnt) {
+		printf("ELF relo section #%zu points to missing section #%zu in %s\n",
+			sec->sec_idx, (size_t)sec->shdr->sh_info, obj->filename);
+		return -EINVAL;
+	}
+	link_sec = &obj->secs[sec->shdr->sh_info];
+
+	/* .rel<secname> -> <secname> pattern is followed */
+	if (strncmp(sec->sec_name, ".rel", sizeof(".rel") - 1) != 0
+	    || strcmp(sec->sec_name + sizeof(".rel") - 1, link_sec->sec_name) != 0) {
+		printf("ELF relo section #%zu name has invalid name in %s\n",
+			sec->sec_idx, obj->filename);
+		return -EINVAL;
+	}
+
+	/* don't further validate relocations for ignored sections */
+	if (link_sec->skipped)
+		return 0;
+
+	/* relocatable section is data or instructions */
+	if (link_sec->shdr->sh_type != SHT_PROGBITS && link_sec->shdr->sh_type != SHT_NOBITS) {
+		printf("ELF relo section #%zu points to invalid section #%zu in %s\n",
+			sec->sec_idx, (size_t)sec->shdr->sh_info, obj->filename);
+		return -EINVAL;
+	}
+
+	/* check sanity of each relocation */
+	n = sec->shdr->sh_size / sec->shdr->sh_entsize;
+	relo = sec->data->d_buf;
+	sym_sec = &obj->secs[obj->symtab_sec_idx];
+	for (i = 0; i < n; i++, relo++) {
+		size_t sym_idx = ELF64_R_SYM(relo->r_info);
+		size_t sym_type = ELF64_R_TYPE(relo->r_info);
+
+		if (sym_type != R_BPF_64_64 && sym_type != R_BPF_64_32 &&
+		    sym_type != R_BPF_64_ABS64 && sym_type != R_BPF_64_ABS32) {
+			printf("ELF relo #%d in section #%zu has unexpected type %zu in %s\n",
+				i, sec->sec_idx, sym_type, obj->filename);
+			return -EINVAL;
+		}
+
+		if (!sym_idx || sym_idx * sizeof(Elf64_Sym) >= sym_sec->shdr->sh_size) {
+			printf("ELF relo #%d in section #%zu points to invalid symbol #%zu in %s\n",
+				i, sec->sec_idx, sym_idx, obj->filename);
+			return -EINVAL;
+		}
+
+		if (link_sec->shdr->sh_flags & SHF_EXECINSTR) {
+			if (relo->r_offset % sizeof(struct bpf_insn) != 0) {
+				printf("ELF relo #%d in section #%zu points to missing symbol #%zu in %s\n",
+					i, sec->sec_idx, sym_idx, obj->filename);
+				return -EINVAL;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int check_btf_type_id(__u32 *type_id, void *ctx)
+{
+	struct btf *btf = ctx;
+
+	if (*type_id >= btf__type_cnt(btf))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int check_btf_str_off(__u32 *str_off, void *ctx)
+{
+	struct btf *btf = ctx;
+	const char *s;
+
+	s = btf__str_by_offset(btf, *str_off);
+
+	if (!s)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int linker_sanity_check_btf(struct src_obj *obj)
+{
+	struct btf_type *t;
+	int i, n, err = 0;
+
+	if (!obj->btf)
+		return 0;
+
+	n = btf__type_cnt(obj->btf);
+	for (i = 1; i < n; i++) {
+		t = btf_type_by_id(obj->btf, i);
+
+		err = err ?: btf_type_visit_type_ids(t, check_btf_type_id, obj->btf);
+		err = err ?: btf_type_visit_str_offs(t, check_btf_str_off, obj->btf);
+		if (err)
+			return err;
+	}
+
+	return 0;
 }

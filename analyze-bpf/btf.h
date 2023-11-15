@@ -54,6 +54,9 @@ const struct btf_type *btf__type_by_id(const struct btf *btf,
 						  __u32 id);
 const char *btf__str_by_offset(const struct btf *btf, __u32 offset);
 
+struct btf_ext *btf_ext__new(const __u8 *data, __u32 size);
+void btf_ext__free(struct btf_ext *btf_ext);
+
 /*
  * A set of helpers for easier BTF types handling.
  *
