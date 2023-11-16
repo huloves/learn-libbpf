@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <libelf.h>
+#include "btf.h"
+
+#include "include/uapi/linux/btf.h"
 
 #ifndef EM_BPF
 #define EM_BPF 247
@@ -83,6 +86,48 @@ struct btf;
 struct btf_type;
 
 struct btf_type *btf_type_by_id(const struct btf *btf, __u32 type_id);
+const char *btf_kind_str(const struct btf_type *t);
+const struct btf_type *skip_mods_and_typedefs(const struct btf *btf, __u32 id, __u32 *res_id);
+
+static inline enum btf_func_linkage btf_func_linkage(const struct btf_type *t)
+{
+	return (enum btf_func_linkage)(int)btf_vlen(t);
+}
+
+static inline __u32 btf_type_info(int kind, int vlen, int kflag)
+{
+	return (kflag << 31) | (kind << 24) | vlen;
+}
+
+enum map_def_parts {
+	MAP_DEF_MAP_TYPE	= 0x001,
+	MAP_DEF_KEY_TYPE	= 0x002,
+	MAP_DEF_KEY_SIZE	= 0x004,
+	MAP_DEF_VALUE_TYPE	= 0x008,
+	MAP_DEF_VALUE_SIZE	= 0x010,
+	MAP_DEF_MAX_ENTRIES	= 0x020,
+	MAP_DEF_MAP_FLAGS	= 0x040,
+	MAP_DEF_NUMA_NODE	= 0x080,
+	MAP_DEF_PINNING		= 0x100,
+	MAP_DEF_INNER_MAP	= 0x200,
+	MAP_DEF_MAP_EXTRA	= 0x400,
+
+	MAP_DEF_ALL		= 0x7ff, /* combination of all above */
+};
+
+struct btf_map_def {
+	enum map_def_parts parts;
+	__u32 map_type;
+	__u32 key_type_id;
+	__u32 key_size;
+	__u32 value_type_id;
+	__u32 value_size;
+	__u32 max_entries;
+	__u32 map_flags;
+	__u32 numa_node;
+	__u32 pinning;
+	__u64 map_extra;
+};
 
 struct btf_ext_info {
 	/*
@@ -100,6 +145,17 @@ struct btf_ext_info {
 	__u32 *sec_idxs;
 	int sec_cnt;
 };
+
+#define for_each_btf_ext_sec(seg, sec)					\
+	for (sec = (seg)->info;						\
+	     (void *)sec < (seg)->info + (seg)->len;			\
+	     sec = (void *)sec + sizeof(struct btf_ext_info_sec) +	\
+		   (seg)->rec_size * sec->num_info)
+
+#define for_each_btf_ext_rec(seg, sec, i, rec)				\
+	for (i = 0, rec = (void *)&(sec)->data;				\
+	     i < (sec)->num_info;					\
+	     i++, rec = (void *)rec + (seg)->rec_size)
 
 /*
  * The .BTF.ext ELF section layout defined as
@@ -175,6 +231,8 @@ typedef int (*type_id_visit_fn)(__u32 *type_id, void *ctx);
 typedef int (*str_off_visit_fn)(__u32 *str_off, void *ctx);
 int btf_type_visit_type_ids(struct btf_type *t, type_id_visit_fn visit, void *ctx);
 int btf_type_visit_str_offs(struct btf_type *t, str_off_visit_fn visit, void *ctx);
+int btf_ext_visit_type_ids(struct btf_ext *btf_ext, type_id_visit_fn visit, void *ctx);
+int btf_ext_visit_str_offs(struct btf_ext *btf_ext, str_off_visit_fn visit, void *ctx);
 
 /* handle direct returned errors */
 static inline int libbpf_err(int ret)

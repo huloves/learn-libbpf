@@ -821,6 +821,130 @@ const char *btf__str_by_offset(const struct btf *btf, __u32 offset)
 		return errno = EINVAL, NULL;
 }
 
+static void btf_invalidate_raw_data(struct btf *btf)
+{
+	if (btf->raw_data) {
+		free(btf->raw_data);
+		btf->raw_data = NULL;
+	}
+	if (btf->raw_data_swapped) {
+		free(btf->raw_data_swapped);
+		btf->raw_data_swapped = NULL;
+	}
+}
+
+/* Ensure BTF is ready to be modified (by splitting into a three memory
+ * regions for header, types, and strings). Also invalidate cached
+ * raw_data, if any.
+ */
+static int btf_ensure_modifiable(struct btf *btf)
+{
+	void *hdr, *types;
+	struct strset *set = NULL;
+	int err = -ENOMEM;
+
+	if (btf_is_modifiable(btf)) {
+		/* any BTF modification invalidates raw_data */
+		btf_invalidate_raw_data(btf);
+		return 0;
+	}
+
+	/* split raw data into three memory regions */
+	hdr = malloc(btf->hdr->hdr_len);
+	types = malloc(btf->hdr->type_len);
+	if (!hdr || !types)
+		goto err_out;
+
+	memcpy(hdr, btf->hdr, btf->hdr->hdr_len);
+	memcpy(types, btf->types_data, btf->hdr->type_len);
+
+	/* build lookup index for all strings */
+	set = strset__new(BTF_MAX_STR_OFFSET, btf->strs_data, btf->hdr->str_len);
+	if (IS_ERR(set)) {
+		err = PTR_ERR(set);
+		goto err_out;
+	}
+
+	/* only when everything was successful, update internal state */
+	btf->hdr = hdr;
+	btf->types_data = types;
+	btf->types_data_cap = btf->hdr->type_len;
+	btf->strs_data = NULL;
+	btf->strs_set = set;
+	/* if BTF was created from scratch, all strings are guaranteed to be
+	 * unique and deduplicated
+	 */
+	if (btf->hdr->str_len == 0)
+		btf->strs_deduped = true;
+	if (!btf->base_btf && btf->hdr->str_len == 1)
+		btf->strs_deduped = true;
+
+	/* invalidate raw_data representation */
+	btf_invalidate_raw_data(btf);
+
+	return 0;
+
+err_out:
+	strset__free(set);
+	free(hdr);
+	free(types);
+	return err;
+}
+
+/* Find an offset in BTF string section that corresponds to a given string *s*.
+ * Returns:
+ *   - >0 offset into string section, if string is found;
+ *   - -ENOENT, if string is not in the string section;
+ *   - <0, on any other error.
+ */
+int btf__find_str(struct btf *btf, const char *s)
+{
+	int off;
+
+	if (btf->base_btf) {
+		off = btf__find_str(btf->base_btf, s);
+		if (off != -ENOENT)
+			return off;
+	}
+
+	/* BTF needs to be in a modifiable state to build string lookup index */
+	if (btf_ensure_modifiable(btf))
+		return libbpf_err(-ENOMEM);
+
+	off = strset__find_str(btf->strs_set, s);
+	if (off < 0)
+		return libbpf_err(off);
+
+	return btf->start_str_off + off;
+}
+
+/* Add a string s to the BTF string section.
+ * Returns:
+ *   - > 0 offset into string section, on success;
+ *   - < 0, on error.
+ */
+int btf__add_str(struct btf *btf, const char *s)
+{
+	int off;
+
+	if (btf->base_btf) {
+		off = btf__find_str(btf->base_btf, s);
+		if (off != -ENOENT)
+			return off;
+	}
+
+	if (btf_ensure_modifiable(btf))
+		return libbpf_err(-ENOMEM);
+
+	off = strset__add_str(btf->strs_set, s);
+	if (off < 0)
+		return libbpf_err(off);
+
+	btf->hdr->str_len = strset__data_size(btf->strs_set);
+
+	return btf->start_str_off + off;
+}
+
 struct btf_ext_sec_setup_param {
 	__u32 off;
 	__u32 len;
@@ -1180,6 +1304,86 @@ int btf_type_visit_str_offs(struct btf_type *t, str_off_visit_fn visit, void *ct
 	}
 	default:
 		break;
+	}
+
+	return 0;
+}
+
+int btf_ext_visit_type_ids(struct btf_ext *btf_ext, type_id_visit_fn visit, void *ctx)
+{
+	const struct btf_ext_info *seg;
+	struct btf_ext_info_sec *sec;
+	int i, err;
+
+	seg = &btf_ext->func_info;
+	for_each_btf_ext_sec(seg, sec) {
+		struct bpf_func_info_min *rec;
+
+		for_each_btf_ext_rec(seg, sec, i, rec) {
+			err = visit(&rec->type_id, ctx);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	seg = &btf_ext->core_relo_info;
+	for_each_btf_ext_sec(seg, sec) {
+		struct bpf_core_relo *rec;
+
+		for_each_btf_ext_rec(seg, sec, i, rec) {
+			err = visit(&rec->type_id, ctx);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
+int btf_ext_visit_str_offs(struct btf_ext *btf_ext, str_off_visit_fn visit, void *ctx)
+{
+	const struct btf_ext_info *seg;
+	struct btf_ext_info_sec *sec;
+	int i, err;
+
+	seg = &btf_ext->func_info;
+	for_each_btf_ext_sec(seg, sec) {
+		err = visit(&sec->sec_name_off, ctx);
+		if (err)
+			return err;
+	}
+
+	seg = &btf_ext->line_info;
+	for_each_btf_ext_sec(seg, sec) {
+		struct bpf_line_info_min *rec;
+
+		err = visit(&sec->sec_name_off, ctx);
+		if (err)
+			return err;
+
+		for_each_btf_ext_rec(seg, sec, i, rec) {
+			err = visit(&rec->file_name_off, ctx);
+			if (err)
+				return err;
+			err = visit(&rec->line_off, ctx);
+			if (err)
+				return err;
+		}
+	}
+
+	seg = &btf_ext->core_relo_info;
+	for_each_btf_ext_sec(seg, sec) {
+		struct bpf_core_relo *rec;
+
+		err = visit(&sec->sec_name_off, ctx);
+		if (err)
+			return err;
+
+		for_each_btf_ext_rec(seg, sec, i, rec) {
+			err = visit(&rec->access_str_off, ctx);
+			if (err)
+				return err;
+		}
 	}
 
 	return 0;
