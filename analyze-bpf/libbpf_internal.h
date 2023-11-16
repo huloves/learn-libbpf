@@ -129,6 +129,10 @@ struct btf_map_def {
 	__u64 map_extra;
 };
 
+int parse_btf_map_def(const char *map_name, struct btf *btf,
+		      const struct btf_type *def_t, bool strict,
+		      struct btf_map_def *map_def, struct btf_map_def *inner_def);
+
 struct btf_ext_info {
 	/*
 	 * info points to the individual info section (e.g. func_info and

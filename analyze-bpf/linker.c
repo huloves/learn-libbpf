@@ -500,7 +500,7 @@ int bpf_linker__add_file(struct bpf_linker *linker, const char *filename,
 	 */
 	err = err ?: linker_load_obj_file(linker, filename, opts, &obj);
 	err = err ?: linker_append_sec_data(linker, &obj);
-	// err = err ?: linker_append_elf_syms(linker, &obj);
+	err = err ?: linker_append_elf_syms(linker, &obj);
 	// err = err ?: linker_append_elf_relos(linker, &obj);
 	// err = err ?: linker_append_btf(linker, &obj);
 	// err = err ?: linker_append_btf_ext(linker, &obj);
@@ -1353,7 +1353,7 @@ static int linker_append_elf_syms(struct bpf_linker *linker, struct src_obj *obj
 			return -EINVAL;
 		}
 
-		// err = linker_append_elf_sym(linker, obj, sym, sym_name, i);
+		err = linker_append_elf_sym(linker, obj, sym, sym_name, i);
 		if (err)
 			return err;
 	}
@@ -1703,7 +1703,7 @@ static bool glob_map_defs_match(const char *sym_name,
 	}
 	t = skip_mods_and_typedefs(obj->btf, t->type, NULL);
 
-	// err = parse_btf_map_def(sym_name, obj->btf, t, true /*strict*/, &src_def, &src_inner_def);
+	err = parse_btf_map_def(sym_name, obj->btf, t, true /*strict*/, &src_def, &src_inner_def);
 	if (err) {
 		printf("global '%s': invalid map definition\n", sym_name);
 		return false;
@@ -1712,7 +1712,7 @@ static bool glob_map_defs_match(const char *sym_name,
 	/* re-parse existing map definition */
 	t = btf__type_by_id(linker->btf, glob_sym->btf_id);
 	t = skip_mods_and_typedefs(linker->btf, t->type, NULL);
-	// err = parse_btf_map_def(sym_name, linker->btf, t, true /*strict*/, &dst_def, &dst_inner_def);
+	err = parse_btf_map_def(sym_name, linker->btf, t, true /*strict*/, &dst_def, &dst_inner_def);
 	if (err) {
 		/* this should not happen, because we already validated it */
 		printf("global '%s': invalid dst map definition\n", sym_name);

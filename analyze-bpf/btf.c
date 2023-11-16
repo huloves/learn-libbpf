@@ -10,6 +10,7 @@
 #include "btf.h"
 #include "libbpf_internal.h"
 #include "strset.h"
+#include "include/linux/kernel.h"
 
 #include "include/uapi/linux/bpf.h"
 
@@ -819,6 +820,129 @@ const char *btf__str_by_offset(const struct btf *btf, __u32 offset)
 		return btf_strs_data(btf) + (offset - btf->start_str_off);
 	else
 		return errno = EINVAL, NULL;
+}
+
+const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
+{
+	return btf__str_by_offset(btf, offset);
+}
+
+static int determine_ptr_size(const struct btf *btf)
+{
+	static const char * const long_aliases[] = {
+		"long",
+		"long int",
+		"int long",
+		"unsigned long",
+		"long unsigned",
+		"unsigned long int",
+		"unsigned int long",
+		"long unsigned int",
+		"long int unsigned",
+		"int unsigned long",
+		"int long unsigned",
+	};
+	const struct btf_type *t;
+	const char *name;
+	int i, j, n;
+
+	if (btf->base_btf && btf->base_btf->ptr_sz > 0)
+		return btf->base_btf->ptr_sz;
+
+	n = btf__type_cnt(btf);
+	for (i = 1; i < n; i++) {
+		t = btf__type_by_id(btf, i);
+		if (!btf_is_int(t))
+			continue;
+
+		if (t->size != 4 && t->size != 8)
+			continue;
+
+		name = btf__name_by_offset(btf, t->name_off);
+		if (!name)
+			continue;
+
+		for (j = 0; j < ARRAY_SIZE(long_aliases); j++) {
+			if (strcmp(name, long_aliases[j]) == 0)
+				return t->size;
+		}
+	}
+
+	return -1;
+}
+
+static size_t btf_ptr_sz(const struct btf *btf)
+{
+	if (!btf->ptr_sz)
+		((struct btf *)btf)->ptr_sz = determine_ptr_size(btf);
+	return btf->ptr_sz < 0 ? sizeof(void *) : btf->ptr_sz;
+}
+
+static bool btf_type_is_void(const struct btf_type *t)
+{
+	return t == &btf_void || btf_is_fwd(t);
+}
+
+static bool btf_type_is_void_or_null(const struct btf_type *t)
+{
+	return !t || btf_type_is_void(t);
+}
+
+#define MAX_RESOLVE_DEPTH 32
+
+__s64 btf__resolve_size(const struct btf *btf, __u32 type_id)
+{
+	const struct btf_array *array;
+	const struct btf_type *t;
+	__u32 nelems = 1;
+	__s64 size = -1;
+	int i;
+
+	t = btf__type_by_id(btf, type_id);
+	for (i = 0; i < MAX_RESOLVE_DEPTH && !btf_type_is_void_or_null(t); i++) {
+		switch (btf_kind(t)) {
+		case BTF_KIND_INT:
+		case BTF_KIND_STRUCT:
+		case BTF_KIND_UNION:
+		case BTF_KIND_ENUM:
+		case BTF_KIND_ENUM64:
+		case BTF_KIND_DATASEC:
+		case BTF_KIND_FLOAT:
+			size = t->size;
+			goto done;
+		case BTF_KIND_PTR:
+			size = btf_ptr_sz(btf);
+			goto done;
+		case BTF_KIND_TYPEDEF:
+		case BTF_KIND_VOLATILE:
+		case BTF_KIND_CONST:
+		case BTF_KIND_RESTRICT:
+		case BTF_KIND_VAR:
+		case BTF_KIND_DECL_TAG:
+		case BTF_KIND_TYPE_TAG:
+			type_id = t->type;
+			break;
+		case BTF_KIND_ARRAY:
+			array = btf_array(t);
+			if (nelems && array->nelems > UINT32_MAX / nelems)
+				return libbpf_err(-E2BIG);
+			nelems *= array->nelems;
+			type_id = array->type;
+			break;
+		default:
+			return libbpf_err(-EINVAL);
+		}
+
+		t = btf__type_by_id(btf, type_id);
+	}
+
+done:
+	if (size < 0)
+		return libbpf_err(-EINVAL);
+	if (nelems && size > UINT32_MAX / nelems)
+		return libbpf_err(-E2BIG);
+
+	return nelems * size;
 }
 
 static void btf_invalidate_raw_data(struct btf *btf)

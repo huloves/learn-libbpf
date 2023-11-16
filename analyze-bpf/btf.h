@@ -50,8 +50,9 @@ struct btf *btf__new(const void *data, __u32 size);
 struct btf *btf__new_empty(void);
 
 __u32 btf__type_cnt(const struct btf *btf);
-const struct btf_type *btf__type_by_id(const struct btf *btf,
-						  __u32 id);
+const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+__s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
 const char *btf__str_by_offset(const struct btf *btf, __u32 offset);
 
 struct btf_ext *btf_ext__new(const __u8 *data, __u32 size);
