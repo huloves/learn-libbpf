@@ -59,6 +59,8 @@ struct btf_ext *btf_ext__new(const __u8 *data, __u32 size);
 void btf_ext__free(struct btf_ext *btf_ext);
 
 int btf__add_str(struct btf *btf, const char *s);
+int btf__add_type(struct btf *btf, const struct btf *src_btf,
+			     const struct btf_type *src_type);
 
 /*
  * A set of helpers for easier BTF types handling.

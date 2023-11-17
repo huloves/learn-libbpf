@@ -19,5 +19,6 @@ struct bpf_linker *bpf_linker__new(const char *filename, struct bpf_linker_opts 
 int bpf_linker__add_file(struct bpf_linker *linker,
 				    const char *filename,
 				    const struct bpf_linker_file_opts *opts);
+void bpf_linker__free(struct bpf_linker *linker);
 
 #endif /* _LIBBPF_H  */

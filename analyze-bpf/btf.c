@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <byteswap.h>
+#include "hashmap.h"
 #include "btf.h"
 #include "libbpf_internal.h"
 #include "strset.h"
@@ -1067,6 +1068,96 @@ int btf__add_str(struct btf *btf, const char *s)
 	btf->hdr->str_len = strset__data_size(btf->strs_set);
 
 	return btf->start_str_off + off;
+}
+
+static void *btf_add_type_mem(struct btf *btf, size_t add_sz)
+{
+	return libbpf_add_mem(&btf->types_data, &btf->types_data_cap, 1,
+			      btf->hdr->type_len, UINT_MAX, add_sz);
+}
+
+static void btf_type_inc_vlen(struct btf_type *t)
+{
+	t->info = btf_type_info(btf_kind(t), btf_vlen(t) + 1, btf_kflag(t));
+}
+
+static int btf_commit_type(struct btf *btf, int data_sz)
+{
+	int err;
+
+	err = btf_add_type_idx_entry(btf, btf->hdr->type_len);
+	if (err)
+		return libbpf_err(err);
+
+	btf->hdr->type_len += data_sz;
+	btf->hdr->str_off += data_sz;
+	btf->nr_types++;
+	return btf->start_id + btf->nr_types - 1;
+}
+
+struct btf_pipe {
+	const struct btf *src;
+	struct btf *dst;
+	struct hashmap *str_off_map; /* map string offsets from src to dst */
+};
+
+static int btf_rewrite_str(__u32 *str_off, void *ctx)
+{
+	struct btf_pipe *p = ctx;
+	long mapped_off;
+	int off, err;
+
+	if (!*str_off) /* nothing to do for empty strings */
+		return 0;
+
+	if (p->str_off_map &&
+	    hashmap__find(p->str_off_map, *str_off, &mapped_off)) {
+		*str_off = mapped_off;
+		return 0;
+	}
+
+	off = btf__add_str(p->dst, btf__str_by_offset(p->src, *str_off));
+	if (off < 0)
+		return off;
+
+	/* Remember string mapping from src to dst.  It avoids
+	 * performing expensive string comparisons.
+	 */
+	if (p->str_off_map) {
+		err = hashmap__append(p->str_off_map, *str_off, off);
+		if (err)
+			return err;
+	}
+
+	*str_off = off;
+	return 0;
+}
+
+int btf__add_type(struct btf *btf, const struct btf *src_btf, const struct btf_type *src_type)
+{
+	struct btf_pipe p = { .src = src_btf, .dst = btf };
+	struct btf_type *t;
+	int sz, err;
+
+	sz = btf_type_size(src_type);
+	if (sz < 0)
+		return libbpf_err(sz);
+
+	/* deconstruct BTF, if necessary, and invalidate raw_data */
+	if (btf_ensure_modifiable(btf))
+		return libbpf_err(-ENOMEM);
+
+	t = btf_add_type_mem(btf, sz);
+	if (!t)
+		return libbpf_err(-ENOMEM);
+
+	memcpy(t, src_type, sz);
+
+	err = btf_type_visit_str_offs(t, btf_rewrite_str, &p);
+	if (err)
+		return libbpf_err(err);
+
+	return btf_commit_type(btf, sz);
 }
 
 struct btf_ext_sec_setup_param {

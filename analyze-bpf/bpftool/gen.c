@@ -51,7 +51,8 @@ static int do_object(int argc, char **argv)
 	}
 
 out:
-	return 0;
+	bpf_linker__free(linker);
+	return err;
 }
 
 static int do_help(int argc, char **argv)

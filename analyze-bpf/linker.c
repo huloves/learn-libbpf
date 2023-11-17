@@ -161,6 +161,9 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 static int linker_append_elf_syms(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 				 Elf64_Sym *sym, const char *sym_name, int src_sym_idx);
+static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj);
+static int linker_append_btf(struct bpf_linker *linker, struct src_obj *obj);
+static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj);
 
 void bpf_linker__free(struct bpf_linker *linker)
 {
@@ -179,8 +182,8 @@ void bpf_linker__free(struct bpf_linker *linker)
 
 	strset__free(linker->strtab_strs);
 
-	// btf__free(linker->btf);
-	// btf_ext__free(linker->btf_ext);
+	btf__free(linker->btf);
+	btf_ext__free(linker->btf_ext);
 
 	for (i = 1; i < linker->sec_cnt; i++) {
 		struct dst_sec *sec = &linker->secs[i];
@@ -501,9 +504,9 @@ int bpf_linker__add_file(struct bpf_linker *linker, const char *filename,
 	err = err ?: linker_load_obj_file(linker, filename, opts, &obj);
 	err = err ?: linker_append_sec_data(linker, &obj);
 	err = err ?: linker_append_elf_syms(linker, &obj);
-	// err = err ?: linker_append_elf_relos(linker, &obj);
-	// err = err ?: linker_append_btf(linker, &obj);
-	// err = err ?: linker_append_btf_ext(linker, &obj);
+	err = err ?: linker_append_elf_relos(linker, &obj);
+	err = err ?: linker_append_btf(linker, &obj);
+	err = err ?: linker_append_btf_ext(linker, &obj);
 
 	return err;
 }
@@ -1174,8 +1177,8 @@ static int extend_sec(struct bpf_linker *linker, struct dst_sec *dst, struct src
 	size_t dst_align_sz, dst_final_sz;
 	int err;
 
-	/* Ephemeral source section doesn't contribute anything to ELF
-	 * section data.
+	/**
+	 * 如果源节是临时节，则不需要添加到目标节中，直接返回
 	 */
 	if (src->ephemeral)
 		return 0;
@@ -1186,12 +1189,18 @@ static int extend_sec(struct bpf_linker *linker, struct dst_sec *dst, struct src
 	 * first non-ephemeral entity appears. In such case, we add ELF
 	 * section, data, etc.
 	 */
+	/**
+	 * 如果目标节是临时节，但源节是非临时节，则需要对目标节进行初始化，将该节提升为非暂存节
+	 */
 	if (dst->ephemeral) {
 		err = init_sec(linker, dst, src);
 		if (err)
 			return err;
 	}
 
+	/**
+	 * 计算目标节和源节的对齐要求，并选择较大的对齐值作为目标节的对齐要求
+	 */
 	dst_align = dst->shdr->sh_addralign;
 	src_align = src->shdr->sh_addralign;
 	if (dst_align == 0)
@@ -1257,20 +1266,35 @@ static bool is_relo_sec(struct src_sec *sec)
 	return sec->shdr->sh_type == SHT_REL;
 }
 
+/**
+ * linker_append_sec_data - 将源对象的部分数据节加入linker的目标节中
+ */
 static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj)
 {
 	int i, err;
 
+	/**
+	 * 遍历源对象的每一个节
+	 */
 	for (i = 1; i < obj->sec_cnt; i++) {
 		struct src_sec *src_sec;
 		struct dst_sec *dst_sec;
 
+		/**
+		 * 只处理数据节
+		 */
 		src_sec = &obj->secs[i];
 		if (!is_data_sec(src_sec))
 			continue;
 
+		/**
+		 * 在linker的目标节中查找数据节
+		 */
 		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
 		if (!dst_sec) {
+			/**
+			 * 若没有则创建一个目标节
+			 */
 			dst_sec = add_dst_sec(linker, src_sec->sec_name);
 			if (!dst_sec)
 				return -ENOMEM;
@@ -1280,14 +1304,23 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 				return err;
 			}
 		} else {
+			/**
+			 * 检查目标节和源节是否兼容
+			 */
 			if (!secs_match(dst_sec, src_sec)) {
 				printf("ELF sections %s are incompatible\n", src_sec->sec_name);
 				return -1;
 			}
 
 			/* "license" and "version" sections are deduped */
+			/**
+			 * "license" 和 "version" 节会进行去重
+			 */
 			if (strcmp(src_sec->sec_name, "license") == 0
 			    || strcmp(src_sec->sec_name, "version") == 0) {
+				/**
+				 * 检查节内容是否相同，内容不相同返回错误码
+				 */
 				if (!sec_content_is_same(dst_sec, src_sec)) {
 					printf("non-identical contents of section '%s' are not supported\n", src_sec->sec_name);
 					return -EINVAL;
@@ -1299,8 +1332,14 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 		}
 
 		/* record mapped section index */
+		/**
+		 * 记录映射的目标节索引
+		 */
 		src_sec->dst_id = dst_sec->id;
 
+		/**
+		 * 扩展目标节以容纳源节的数据
+		 */
 		err = extend_sec(linker, dst_sec, src_sec);
 		if (err)
 			return err;
@@ -2208,6 +2247,435 @@ add_sym:
 		glob_sym->btf_id = 0;
 		glob_sym->is_extern = sym_is_extern;
 		glob_sym->is_weak = sym_bind == STB_WEAK;
+	}
+
+	return 0;
+}
+
+static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *obj)
+{
+	struct src_sec *src_symtab = &obj->secs[obj->symtab_sec_idx];
+	int i, err;
+
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *src_sec, *src_linked_sec;
+		struct dst_sec *dst_sec, *dst_linked_sec;
+		Elf64_Rel *src_rel, *dst_rel;
+		int j, n;
+
+		src_sec = &obj->secs[i];
+		if (!is_relo_sec(src_sec))
+			continue;
+
+		/* shdr->sh_info points to relocatable section */
+		src_linked_sec = &obj->secs[src_sec->shdr->sh_info];
+		if (src_linked_sec->skipped)
+			continue;
+
+		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
+		if (!dst_sec) {
+			dst_sec = add_dst_sec(linker, src_sec->sec_name);
+			if (!dst_sec)
+				return -ENOMEM;
+			err = init_sec(linker, dst_sec, src_sec);
+			if (err) {
+				printf("failed to init section '%s'\n", src_sec->sec_name);
+				return err;
+			}
+		} else if (!secs_match(dst_sec, src_sec)) {
+			printf("sections %s are not compatible\n", src_sec->sec_name);
+			return -1;
+		}
+
+		/* shdr->sh_link points to SYMTAB */
+		dst_sec->shdr->sh_link = linker->symtab_sec_idx;
+
+		/* shdr->sh_info points to relocated section */
+		dst_linked_sec = &linker->secs[src_linked_sec->dst_id];
+		dst_sec->shdr->sh_info = dst_linked_sec->sec_idx;
+
+		src_sec->dst_id = dst_sec->id;
+		err = extend_sec(linker, dst_sec, src_sec);
+		if (err)
+			return err;
+
+		src_rel = src_sec->data->d_buf;
+		dst_rel = dst_sec->raw_data + src_sec->dst_off;
+		n = src_sec->shdr->sh_size / src_sec->shdr->sh_entsize;
+		for (j = 0; j < n; j++, src_rel++, dst_rel++) {
+			size_t src_sym_idx, dst_sym_idx, sym_type;
+			Elf64_Sym *src_sym;
+
+			src_sym_idx = ELF64_R_SYM(src_rel->r_info);
+			src_sym = src_symtab->data->d_buf + sizeof(*src_sym) * src_sym_idx;
+
+			dst_sym_idx = obj->sym_map[src_sym_idx];
+			dst_rel->r_offset += src_linked_sec->dst_off;
+			sym_type = ELF64_R_TYPE(src_rel->r_info);
+			dst_rel->r_info = ELF64_R_INFO(dst_sym_idx, sym_type);
+
+			if (ELF64_ST_TYPE(src_sym->st_info) == STT_SECTION) {
+				struct src_sec *sec = &obj->secs[src_sym->st_shndx];
+				struct bpf_insn *insn;
+
+				if (src_linked_sec->shdr->sh_flags & SHF_EXECINSTR) {
+					/* calls to the very first static function inside
+					 * .text section at offset 0 will
+					 * reference section symbol, not the
+					 * function symbol. Fix that up,
+					 * otherwise it won't be possible to
+					 * relocate calls to two different
+					 * static functions with the same name
+					 * (rom two different object files)
+					 */
+					insn = dst_linked_sec->raw_data + dst_rel->r_offset;
+					if (insn->code == (BPF_JMP | BPF_CALL))
+						insn->imm += sec->dst_off / sizeof(struct bpf_insn);
+					else
+						insn->imm += sec->dst_off;
+				} else {
+					printf("relocation against STT_SECTION in non-exec section is not supported!\n");
+					return -EINVAL;
+				}
+			}
+
+		}
+	}
+
+	return 0;
+}
+
+static int remap_type_id(__u32 *type_id, void *ctx)
+{
+	int *id_map = ctx;
+	int new_id = id_map[*type_id];
+
+	/* Error out if the type wasn't remapped. Ignore VOID which stays VOID. */
+	if (new_id == 0 && *type_id != 0) {
+		printf("failed to find new ID mapping for original BTF type ID %u\n", *type_id);
+		return -EINVAL;
+	}
+
+	*type_id = id_map[*type_id];
+
+	return 0;
+}
+
+static int linker_append_btf(struct bpf_linker *linker, struct src_obj *obj)
+{
+	const struct btf_type *t;
+	int i, j, n, start_id, id;
+	const char *name;
+
+	if (!obj->btf)
+		return 0;
+
+	start_id = btf__type_cnt(linker->btf);
+	n = btf__type_cnt(obj->btf);
+
+	obj->btf_type_map = calloc(n + 1, sizeof(int));
+	if (!obj->btf_type_map)
+		return -ENOMEM;
+
+	for (i = 1; i < n; i++) {
+		struct glob_sym *glob_sym = NULL;
+
+		t = btf__type_by_id(obj->btf, i);
+
+		/* DATASECs are handled specially below */
+		if (btf_kind(t) == BTF_KIND_DATASEC)
+			continue;
+
+		if (btf_is_non_static(t)) {
+			/* there should be glob_sym already */
+			name = btf__str_by_offset(obj->btf, t->name_off);
+			glob_sym = find_glob_sym(linker, name);
+
+			/* VARs without corresponding glob_sym are those that
+			 * belong to skipped/deduplicated sections (i.e.,
+			 * license and version), so just skip them
+			 */
+			if (!glob_sym)
+				continue;
+
+			/* linker_append_elf_sym() might have requested
+			 * updating underlying type ID, if extern was resolved
+			 * to strong symbol or weak got upgraded to non-weak
+			 */
+			if (glob_sym->underlying_btf_id == 0)
+				glob_sym->underlying_btf_id = -t->type;
+
+			/* globals from previous object files that match our
+			 * VAR/FUNC already have a corresponding associated
+			 * BTF type, so just make sure to use it
+			 */
+			if (glob_sym->btf_id) {
+				/* reuse existing BTF type for global var/func */
+				obj->btf_type_map[i] = glob_sym->btf_id;
+				continue;
+			}
+		}
+
+		id = btf__add_type(linker->btf, obj->btf, t);
+		if (id < 0) {
+			printf("failed to append BTF type #%d from file '%s'\n", i, obj->filename);
+			return id;
+		}
+
+		obj->btf_type_map[i] = id;
+
+		/* record just appended BTF type for var/func */
+		if (glob_sym) {
+			glob_sym->btf_id = id;
+			glob_sym->underlying_btf_id = -t->type;
+		}
+	}
+
+	/* remap all the types except DATASECs */
+	n = btf__type_cnt(linker->btf);
+	for (i = start_id; i < n; i++) {
+		struct btf_type *dst_t = btf_type_by_id(linker->btf, i);
+
+		if (btf_type_visit_type_ids(dst_t, remap_type_id, obj->btf_type_map))
+			return -EINVAL;
+	}
+
+	/* Rewrite VAR/FUNC underlying types (i.e., FUNC's FUNC_PROTO and VAR's
+	 * actual type), if necessary
+	 */
+	for (i = 0; i < linker->glob_sym_cnt; i++) {
+		struct glob_sym *glob_sym = &linker->glob_syms[i];
+		struct btf_type *glob_t;
+
+		if (glob_sym->underlying_btf_id >= 0)
+			continue;
+
+		glob_sym->underlying_btf_id = obj->btf_type_map[-glob_sym->underlying_btf_id];
+
+		glob_t = btf_type_by_id(linker->btf, glob_sym->btf_id);
+		glob_t->type = glob_sym->underlying_btf_id;
+	}
+
+	/* append DATASEC info */
+	for (i = 1; i < obj->sec_cnt; i++) {
+		struct src_sec *src_sec;
+		struct dst_sec *dst_sec;
+		const struct btf_var_secinfo *src_var;
+		struct btf_var_secinfo *dst_var;
+
+		src_sec = &obj->secs[i];
+		if (!src_sec->sec_type_id || src_sec->skipped)
+			continue;
+		dst_sec = &linker->secs[src_sec->dst_id];
+
+		/* Mark section as having BTF regardless of the presence of
+		 * variables. In some cases compiler might generate empty BTF
+		 * with no variables information. E.g., when promoting local
+		 * array/structure variable initial values and BPF object
+		 * file otherwise has no read-only static variables in
+		 * .rodata. We need to preserve such empty BTF and just set
+		 * correct section size.
+		 */
+		dst_sec->has_btf = true;
+
+		t = btf__type_by_id(obj->btf, src_sec->sec_type_id);
+		src_var = btf_var_secinfos(t);
+		n = btf_vlen(t);
+		for (j = 0; j < n; j++, src_var++) {
+			void *sec_vars = dst_sec->sec_vars;
+			int new_id = obj->btf_type_map[src_var->type];
+			struct glob_sym *glob_sym = NULL;
+
+			t = btf_type_by_id(linker->btf, new_id);
+			if (btf_is_non_static(t)) {
+				name = btf__str_by_offset(linker->btf, t->name_off);
+				glob_sym = find_glob_sym(linker, name);
+				if (glob_sym->sec_id != dst_sec->id) {
+					printf("global '%s': section mismatch %d vs %d\n",
+						name, glob_sym->sec_id, dst_sec->id);
+					return -EINVAL;
+				}
+			}
+
+			/* If there is already a member (VAR or FUNC) mapped
+			 * to the same type, don't add a duplicate entry.
+			 * This will happen when multiple object files define
+			 * the same extern VARs/FUNCs.
+			 */
+			if (glob_sym && glob_sym->var_idx >= 0) {
+				__s64 sz;
+
+				dst_var = &dst_sec->sec_vars[glob_sym->var_idx];
+				/* Because underlying BTF type might have
+				 * changed, so might its size have changed, so
+				 * re-calculate and update it in sec_var.
+				 */
+				sz = btf__resolve_size(linker->btf, glob_sym->underlying_btf_id);
+				if (sz < 0) {
+					printf("global '%s': failed to resolve size of underlying type: %d\n",
+						name, (int)sz);
+					return -EINVAL;
+				}
+				dst_var->size = sz;
+				continue;
+			}
+
+			sec_vars = libbpf_reallocarray(sec_vars,
+						       dst_sec->sec_var_cnt + 1,
+						       sizeof(*dst_sec->sec_vars));
+			if (!sec_vars)
+				return -ENOMEM;
+
+			dst_sec->sec_vars = sec_vars;
+			dst_sec->sec_var_cnt++;
+
+			dst_var = &dst_sec->sec_vars[dst_sec->sec_var_cnt - 1];
+			dst_var->type = obj->btf_type_map[src_var->type];
+			dst_var->size = src_var->size;
+			dst_var->offset = src_sec->dst_off + src_var->offset;
+
+			if (glob_sym)
+				glob_sym->var_idx = dst_sec->sec_var_cnt - 1;
+		}
+	}
+
+	return 0;
+}
+
+static void *add_btf_ext_rec(struct btf_ext_sec_data *ext_data, const void *src_rec)
+{
+	void *tmp;
+
+	tmp = libbpf_reallocarray(ext_data->recs, ext_data->rec_cnt + 1, ext_data->rec_sz);
+	if (!tmp)
+		return NULL;
+	ext_data->recs = tmp;
+
+	tmp += ext_data->rec_cnt * ext_data->rec_sz;
+	memcpy(tmp, src_rec, ext_data->rec_sz);
+
+	ext_data->rec_cnt++;
+
+	return tmp;
+}
+
+static int linker_append_btf_ext(struct bpf_linker *linker, struct src_obj *obj)
+{
+	const struct btf_ext_info_sec *ext_sec;
+	const char *sec_name, *s;
+	struct src_sec *src_sec;
+	struct dst_sec *dst_sec;
+	int rec_sz, str_off, i;
+
+	if (!obj->btf_ext)
+		return 0;
+
+	rec_sz = obj->btf_ext->func_info.rec_size;
+	for_each_btf_ext_sec(&obj->btf_ext->func_info, ext_sec) {
+		struct bpf_func_info_min *src_rec, *dst_rec;
+
+		sec_name = btf__name_by_offset(obj->btf, ext_sec->sec_name_off);
+		src_sec = find_src_sec_by_name(obj, sec_name);
+		if (!src_sec) {
+			printf("can't find section '%s' referenced from .BTF.ext\n", sec_name);
+			return -EINVAL;
+		}
+		dst_sec = &linker->secs[src_sec->dst_id];
+
+		if (dst_sec->func_info.rec_sz == 0)
+			dst_sec->func_info.rec_sz = rec_sz;
+		if (dst_sec->func_info.rec_sz != rec_sz) {
+			printf("incompatible .BTF.ext record sizes for section '%s'\n", sec_name);
+			return -EINVAL;
+		}
+
+		for_each_btf_ext_rec(&obj->btf_ext->func_info, ext_sec, i, src_rec) {
+			dst_rec = add_btf_ext_rec(&dst_sec->func_info, src_rec);
+			if (!dst_rec)
+				return -ENOMEM;
+
+			dst_rec->insn_off += src_sec->dst_off;
+			dst_rec->type_id = obj->btf_type_map[dst_rec->type_id];
+		}
+	}
+
+	rec_sz = obj->btf_ext->line_info.rec_size;
+	for_each_btf_ext_sec(&obj->btf_ext->line_info, ext_sec) {
+		struct bpf_line_info_min *src_rec, *dst_rec;
+
+		sec_name = btf__name_by_offset(obj->btf, ext_sec->sec_name_off);
+		src_sec = find_src_sec_by_name(obj, sec_name);
+		if (!src_sec) {
+			printf("can't find section '%s' referenced from .BTF.ext\n", sec_name);
+			return -EINVAL;
+		}
+		dst_sec = &linker->secs[src_sec->dst_id];
+
+		if (dst_sec->line_info.rec_sz == 0)
+			dst_sec->line_info.rec_sz = rec_sz;
+		if (dst_sec->line_info.rec_sz != rec_sz) {
+			printf("incompatible .BTF.ext record sizes for section '%s'\n", sec_name);
+			return -EINVAL;
+		}
+
+		for_each_btf_ext_rec(&obj->btf_ext->line_info, ext_sec, i, src_rec) {
+			dst_rec = add_btf_ext_rec(&dst_sec->line_info, src_rec);
+			if (!dst_rec)
+				return -ENOMEM;
+
+			dst_rec->insn_off += src_sec->dst_off;
+
+			s = btf__str_by_offset(obj->btf, src_rec->file_name_off);
+			str_off = btf__add_str(linker->btf, s);
+			if (str_off < 0)
+				return -ENOMEM;
+			dst_rec->file_name_off = str_off;
+
+			s = btf__str_by_offset(obj->btf, src_rec->line_off);
+			str_off = btf__add_str(linker->btf, s);
+			if (str_off < 0)
+				return -ENOMEM;
+			dst_rec->line_off = str_off;
+
+			/* dst_rec->line_col is fine */
+		}
+	}
+
+	rec_sz = obj->btf_ext->core_relo_info.rec_size;
+	for_each_btf_ext_sec(&obj->btf_ext->core_relo_info, ext_sec) {
+		struct bpf_core_relo *src_rec, *dst_rec;
+
+		sec_name = btf__name_by_offset(obj->btf, ext_sec->sec_name_off);
+		src_sec = find_src_sec_by_name(obj, sec_name);
+		if (!src_sec) {
+			printf("can't find section '%s' referenced from .BTF.ext\n", sec_name);
+			return -EINVAL;
+		}
+		dst_sec = &linker->secs[src_sec->dst_id];
+
+		if (dst_sec->core_relo_info.rec_sz == 0)
+			dst_sec->core_relo_info.rec_sz = rec_sz;
+		if (dst_sec->core_relo_info.rec_sz != rec_sz) {
+			printf("incompatible .BTF.ext record sizes for section '%s'\n", sec_name);
+			return -EINVAL;
+		}
+
+		for_each_btf_ext_rec(&obj->btf_ext->core_relo_info, ext_sec, i, src_rec) {
+			dst_rec = add_btf_ext_rec(&dst_sec->core_relo_info, src_rec);
+			if (!dst_rec)
+				return -ENOMEM;
+
+			dst_rec->insn_off += src_sec->dst_off;
+			dst_rec->type_id = obj->btf_type_map[dst_rec->type_id];
+
+			s = btf__str_by_offset(obj->btf, src_rec->access_str_off);
+			str_off = btf__add_str(linker->btf, s);
+			if (str_off < 0)
+				return -ENOMEM;
+			dst_rec->access_str_off = str_off;
+
+			/* dst_rec->kind is fine */
+		}
 	}
 
 	return 0;
