@@ -53,6 +53,7 @@ __u32 btf__type_cnt(const struct btf *btf);
 const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
 __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
 const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
+const void *btf__raw_data(const struct btf *btf, __u32 *size);
 const char *btf__str_by_offset(const struct btf *btf, __u32 offset);
 
 struct btf_ext *btf_ext__new(const __u8 *data, __u32 size);
@@ -61,6 +62,32 @@ void btf_ext__free(struct btf_ext *btf_ext);
 int btf__add_str(struct btf *btf, const char *s);
 int btf__add_type(struct btf *btf, const struct btf *src_btf,
 			     const struct btf_type *src_type);
+
+enum btf_fwd_kind {
+	BTF_FWD_STRUCT = 0,
+	BTF_FWD_UNION = 1,
+	BTF_FWD_ENUM = 2,
+};
+
+int btf__add_fwd(struct btf *btf, const char *name, enum btf_fwd_kind fwd_kind);
+int btf__add_typedef(struct btf *btf, const char *name, int ref_type_id);
+
+/* var & datasec construction APIs */
+int btf__add_datasec(struct btf *btf, const char *name, __u32 byte_sz);
+int btf__add_datasec_var_info(struct btf *btf, int var_type_id,
+					 __u32 offset, __u32 byte_sz);
+
+struct btf_dedup_opts {
+	size_t sz;
+	/* optional .BTF.ext info to dedup along the main BTF info */
+	struct btf_ext *btf_ext;
+	/* force hash collisions (used for testing) */
+	bool force_collisions;
+	size_t :0;
+};
+#define btf_dedup_opts__last_field force_collisions
+
+int btf__dedup(struct btf *btf, const struct btf_dedup_opts *opts);
 
 /*
  * A set of helpers for easier BTF types handling.

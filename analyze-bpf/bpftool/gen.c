@@ -50,6 +50,13 @@ static int do_object(int argc, char **argv)
 		}
 	}
 
+	err = bpf_linker__finalize(linker);
+	if (err) {
+		printf("failed to finalize ELF file: %s (%d)", strerror(errno), errno);
+		goto out;
+	}
+
+	err = 0;
 out:
 	bpf_linker__free(linker);
 	return err;
