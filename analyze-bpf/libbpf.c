@@ -2,11 +2,517 @@
 #include <string.h>
 #include <linux/err.h>
 #include <errno.h>
+#include <sys/resource.h>
+#include "libbpf.h"
 #include "btf.h"
 #include "libbpf_internal.h"
+#include "libbpf_legacy.h"
+#include "libbpf_version.h"
 
 #include "include/uapi/linux/bpf.h"
 #include "include/uapi/linux/btf.h"
+
+#ifndef BPF_FS_MAGIC
+#define BPF_FS_MAGIC		0xcafe4a11
+#endif
+
+#define BPF_INSN_SZ (sizeof(struct bpf_insn))
+
+#define __printf(a, b)	__attribute__((format(printf, a, b)))
+
+static const char * const attach_type_name[] = {
+
+};
+
+static const char * const link_type_name[] = {
+
+};
+
+static const char * const map_type_name[] = {
+
+};
+
+static const char * const prog_type_name[] = {
+
+};
+
+static int __base_pr(enum libbpf_print_level level, const char *format,
+		     va_list args)
+{
+	if (level == LIBBPF_DEBUG)
+		return 0;
+
+	return vfprintf(stderr, format, args);
+}
+
+static libbpf_print_fn_t __libbpf_pr = __base_pr;
+
+libbpf_print_fn_t libbpf_set_print(libbpf_print_fn_t fn)
+{
+	libbpf_print_fn_t old_print_fn;
+
+	old_print_fn = __atomic_exchange_n(&__libbpf_pr, fn, __ATOMIC_RELAXED);
+
+	return old_print_fn;
+}
+
+__printf(2, 3)
+void libbpf_print(enum libbpf_print_level level, const char *format, ...)
+{
+	va_list args;
+	int old_errno;
+	libbpf_print_fn_t print_fn;
+
+	print_fn = __atomic_load_n(&__libbpf_pr, __ATOMIC_RELAXED);
+	if (!print_fn)
+		return;
+
+	old_errno = errno;
+
+	va_start(args, format);
+	__libbpf_pr(level, format, args);
+	va_end(args);
+
+	errno = old_errno;
+}
+
+static void pr_perm_msg(int err)
+{
+	struct rlimit limit;
+	char buf[100];
+
+	if (err != -EPERM || geteuid() != 0)
+		return;
+
+	err = getrlimit(RLIMIT_MEMLOCK, &limit);
+	if (err)
+		return;
+
+	if (limit.rlim_cur == RLIM_INFINITY)
+		return;
+
+	if (limit.rlim_cur < 1024)
+		snprintf(buf, sizeof(buf), "%zu bytes", (size_t)limit.rlim_cur);
+	else if (limit.rlim_cur < 1024*1024)
+		snprintf(buf, sizeof(buf), "%.1f KiB", (double)limit.rlim_cur / 1024);
+	else
+		snprintf(buf, sizeof(buf), "%.1f MiB", (double)limit.rlim_cur / (1024*1024));
+
+	printf("permission error while running as root; try raising 'ulimit -l'? current value: %s\n",
+		buf);
+}
+
+#define STRERR_BUFSIZE  128
+
+/* Copied from tools/perf/util/util.h */
+#ifndef zfree
+# define zfree(ptr) ({ free(*ptr); *ptr = NULL; })
+#endif
+
+#ifndef zclose
+# define zclose(fd) ({			\
+	int ___err = 0;			\
+	if ((fd) >= 0)			\
+		___err = close((fd));	\
+	fd = -1;			\
+	___err; })
+#endif
+
+static inline __u64 ptr_to_u64(const void *ptr)
+{
+	return (__u64) (unsigned long) ptr;
+}
+
+int libbpf_set_strict_mode(enum libbpf_strict_mode mode)
+{
+	/* as of v1.0 libbpf_set_strict_mode() is a no-op */
+	return 0;
+}
+
+__u32 libbpf_major_version(void)
+{
+	return LIBBPF_MAJOR_VERSION;
+}
+
+__u32 libbpf_minor_version(void)
+{
+	return LIBBPF_MINOR_VERSION;
+}
+
+const char *libbpf_version_string(void)
+{
+#define __S(X) #X
+#define _S(X) __S(X)
+	return  "v" _S(LIBBPF_MAJOR_VERSION) "." _S(LIBBPF_MINOR_VERSION);
+#undef _S
+#undef __S
+}
+
+/**
+ * 重定位类型
+ */
+enum reloc_type {
+	/* 64位加载指令 */
+	RELO_LD64,
+	/* 调用指令 */
+	RELO_CALL,
+	/* 数据 */
+	RELO_DATA,
+	/* 外部64位加载指令 */
+	RELO_EXTERN_LD64,
+	/* 外部调用指令 */
+	RELO_EXTERN_CALL,
+	/* 子程序地址 */
+	RELO_SUBPROG_ADDR,
+	/* 核心(内核?) */
+	RELO_CORE,
+};
+
+struct reloc_desc {
+	enum reloc_type type;
+	int insn_idx;
+	union {
+		const struct bpf_core_relo *core_relo; /* used when type == RELO_CORE */
+		struct {
+			int map_idx;
+			int sym_off;
+			int ext_idx;
+		};
+	};
+};
+
+/* stored as sec_def->cookie for all libbpf-supported SEC()s */
+enum sec_def_flags {
+	SEC_NONE = 0,
+};
+
+struct bpf_sec_def {
+	char *sec;
+	enum bpf_prog_type prog_type;
+	enum bpf_attach_type expected_attach_type;
+	long cookie;
+	int handler_id;
+
+	/**
+	 * typedef int (*libbpf_prog_setup_fn_t)(struct bpf_program *prog, long cookie);
+	 */
+	libbpf_prog_setup_fn_t prog_setup_fn;
+	/**
+	 * typedef int (*libbpf_prog_prepare_load_fn_t)(struct bpf_program *prog,
+	 *				     struct bpf_prog_load_opts *opts, long cookie);
+	 */
+	libbpf_prog_prepare_load_fn_t prog_prepare_load_fn;
+	/**
+	 * typedef int (*libbpf_prog_attach_fn_t)(const struct bpf_program *prog, long cookie,
+	 *			       struct bpf_link **link);
+	 */
+	libbpf_prog_attach_fn_t prog_attach_fn;
+};
+
+/*
+ * bpf_prog should be a better name but it has been used in
+ * linux/filter.h.
+ */
+struct bpf_program {
+	char *name;
+	char *sec_name;
+	size_t sec_idx;
+	const struct bpf_sec_def *sec_def;
+	/* this program's instruction offset (in number of instructions)
+	 * within its containing ELF section
+	 */
+	size_t sec_insn_off;
+	/* number of original instructions in ELF section belonging to this
+	 * program, not taking into account subprogram instructions possible
+	 * appended later during relocation
+	 */
+	size_t sec_insn_cnt;
+	/* Offset (in number of instructions) of the start of instruction
+	 * belonging to this BPF program  within its containing main BPF
+	 * program. For the entry-point (main) BPF program, this is always
+	 * zero. For a sub-program, this gets reset before each of main BPF
+	 * programs are processed and relocated and is used to determined
+	 * whether sub-program was already appended to the main program, and
+	 * if yes, at which instruction offset.
+	 */
+	size_t sub_insn_off;
+
+	/* instructions that belong to BPF program; insns[0] is located at
+	 * sec_insn_off instruction within its ELF section in ELF file, so
+	 * when mapping ELF file instruction index to the local instruction,
+	 * one needs to subtract sec_insn_off; and vice versa.
+	 */
+	struct bpf_insn *insns;
+	/* actual number of instruction in this BPF program's image; for
+	 * entry-point BPF programs this includes the size of main program
+	 * itself plus all the used sub-programs, appended at the end
+	 */
+	size_t insns_cnt;
+
+	struct reloc_desc *reloc_desc;
+	int nr_reloc;
+
+	/* BPF verifier log settings */
+	char *log_buf;
+	size_t log_size;
+	__u32 log_level;
+
+	struct bpf_object *obj;
+
+	int fd;
+	bool autoload;
+	bool autoattach;
+	bool sym_global;
+	bool mark_btf_static;
+	enum bpf_prog_type type;
+	enum bpf_attach_type expected_attach_type;
+	int exception_cb_idx;
+
+	int prog_ifindex;
+	__u32 attach_btf_obj_fd;
+	__u32 attach_btf_id;
+	__u32 attach_prog_fd;
+
+	void *func_info;
+	__u32 func_info_rec_size;
+	__u32 func_info_cnt;
+
+	void *line_info;
+	__u32 line_info_rec_size;
+	__u32 line_info_cnt;
+	__u32 prog_flags;
+};
+
+struct bpf_struct_ops {
+	const char *tname;
+	const struct btf_type *type;
+	struct bpf_program **progs;
+	__u32 *kern_func_off;
+	/* e.g. struct tcp_congestion_ops in bpf_prog's btf format */
+	void *data;
+	/* e.g. struct bpf_struct_ops_tcp_congestion_ops in
+	 *      btf_vmlinux's format.
+	 * struct bpf_struct_ops_tcp_congestion_ops {
+	 *	[... some other kernel fields ...]
+	 *	struct tcp_congestion_ops data;
+	 * }
+	 * kern_vdata-size == sizeof(struct bpf_struct_ops_tcp_congestion_ops)
+	 * bpf_map__init_kern_struct_ops() will populate the "kern_vdata"
+	 * from "data".
+	 */
+	void *kern_vdata;
+	__u32 type_id;
+};
+
+#define DATA_SEC ".data"
+#define BSS_SEC ".bss"
+#define RODATA_SEC ".rodata"
+#define KCONFIG_SEC ".kconfig"
+#define KSYMS_SEC ".ksyms"
+#define STRUCT_OPS_SEC ".struct_ops"
+#define STRUCT_OPS_LINK_SEC ".struct_ops.link"
+
+enum libbpf_map_type {
+	LIBBPF_MAP_UNSPEC,
+	LIBBPF_MAP_DATA,
+	LIBBPF_MAP_BSS,
+	LIBBPF_MAP_RODATA,
+	LIBBPF_MAP_KCONFIG,
+};
+
+struct bpf_map_def {
+	unsigned int type;
+	unsigned int key_size;
+	unsigned int value_size;
+	unsigned int max_entries;
+	unsigned int map_flags;
+};
+
+struct bpf_map {
+	struct bpf_object *obj;
+	char *name;
+	/* real_name is defined for special internal maps (.rodata*,
+	 * .data*, .bss, .kconfig) and preserves their original ELF section
+	 * name. This is important to be able to find corresponding BTF
+	 * DATASEC information.
+	 */
+	char *real_name;
+	int fd;
+	int sec_idx;
+	size_t sec_offset;
+	int map_ifindex;
+	int inner_map_fd;
+	struct bpf_map_def def;
+	__u32 numa_node;
+	__u32 btf_var_idx;
+	__u32 btf_key_type_id;
+	__u32 btf_value_type_id;
+	__u32 btf_vmlinux_value_type_id;
+	enum libbpf_map_type libbpf_type;
+	void *mmaped;
+	struct bpf_struct_ops *st_ops;
+	struct bpf_map *inner_map;
+	void **init_slots;
+	int init_slots_sz;
+	char *pin_path;
+	bool pinned;
+	bool reused;
+	bool autocreate;
+	__u64 map_extra;
+};
+
+enum extern_type {
+	EXT_UNKNOWN,
+	EXT_KCFG,
+	EXT_KSYM,
+};
+
+enum kcfg_type {
+	KCFG_UNKNOWN,
+	KCFG_CHAR,
+	KCFG_BOOL,
+	KCFG_INT,
+	KCFG_TRISTATE,
+	KCFG_CHAR_ARR,
+};
+
+struct extern_desc {
+	enum extern_type type;
+	int sym_idx;
+	int btf_id;
+	int sec_btf_id;
+	const char *name;
+	char *essent_name;
+	bool is_set;
+	bool is_weak;
+	union {
+		struct {
+			enum kcfg_type type;
+			int sz;
+			int align;
+			int data_off;
+			bool is_signed;
+		} kcfg;
+		struct {
+			unsigned long long addr;
+
+			/* target btf_id of the corresponding kernel var. */
+			int kernel_btf_obj_fd;
+			int kernel_btf_id;
+
+			/* local btf_id of the ksym extern's type. */
+			__u32 type_id;
+			/* BTF fd index to be patched in for insn->off, this is
+			 * 0 for vmlinux BTF, index in obj->fd_array for module
+			 * BTF
+			 */
+			__s16 btf_fd_idx;
+		} ksym;
+	};
+};
+
+struct module_btf {
+	struct btf *btf;
+	char *name;
+	__u32 id;
+	int fd;
+	int fd_array_idx;
+};
+
+enum sec_type {
+	SEC_UNUSED = 0,
+	SEC_RELO,
+	SEC_BSS,
+	SEC_DATA,
+	SEC_RODATA,
+};
+
+struct elf_sec_desc {
+	enum sec_type sec_type;
+	Elf64_Shdr *shdr;
+	Elf_Data *data;
+};
+
+struct elf_state {
+	int fd;
+	const void *obj_buf;
+	size_t obj_buf_sz;
+	Elf *elf;
+	Elf64_Ehdr *ehdr;
+	Elf_Data *symbols;
+	Elf_Data *st_ops_data;
+	Elf_Data *st_ops_link_data;
+	size_t shstrndx; /* section index for section name strings */
+	size_t strtabidx;
+	struct elf_sec_desc *secs;
+	size_t sec_cnt;
+	int btf_maps_shndx;
+	__u32 btf_maps_sec_btf_id;
+	int text_shndx;
+	int symbols_shndx;
+	int st_ops_shndx;
+	int st_ops_link_shndx;
+};
+
+struct usdt_manager;
+
+struct bpf_object {
+	char name[BPF_OBJ_NAME_LEN];
+	char license[64];
+	__u32 kern_version;
+
+	struct bpf_program *programs;
+	size_t nr_programs;
+	struct bpf_map *maps;
+	size_t nr_maps;
+	size_t maps_cap;
+
+	char *kconfig;
+	struct extern_desc *externs;
+	int nr_extern;
+	int kconfig_map_idx;
+
+	bool loaded;
+	bool has_subcalls;
+	bool has_rodata;
+
+	struct bpf_gen *gen_loader;
+
+	/* Information when doing ELF related work. Only valid if efile.elf is not NULL */
+	struct elf_state efile;
+
+	struct btf *btf;
+	struct btf_ext *btf_ext;
+
+	/* Parse and load BTF vmlinux if any of the programs in the object need
+	 * it at load time.
+	 */
+	struct btf *btf_vmlinux;
+	/* Path to the custom BTF to be used for BPF CO-RE relocations as an
+	 * override for vmlinux BTF.
+	 */
+	char *btf_custom_path;
+	/* vmlinux BTF override for CO-RE relocations */
+	struct btf *btf_vmlinux_override;
+	/* Lazily initialized kernel module BTFs */
+	struct module_btf *btf_modules;
+	bool btf_modules_loaded;
+	size_t btf_module_cnt;
+	size_t btf_module_cap;
+
+	/* optional log settings passed to BPF_BTF_LOAD and BPF_PROG_LOAD commands */
+	char *log_buf;
+	size_t log_size;
+	__u32 log_level;
+
+	int *fd_array;
+	size_t fd_array_cap;
+	size_t fd_array_cnt;
+
+	struct usdt_manager *usdt_man;
+
+	char path[];
+};
 
 static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 {
@@ -16,7 +522,7 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
-long libbpf_get_error(const char *ptr)
+long libbpf_get_error(const void *ptr)
 {
 	if (!IS_ERR_OR_NULL(ptr))
 		return 0;

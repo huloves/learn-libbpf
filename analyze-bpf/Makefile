@@ -3,7 +3,7 @@ BUILD_DIR = ./build
 INCLUDE := -Iinclude/ -Iinclude/uapi/
 
 OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/linker.o $(BUILD_DIR)/hashmap.o $(BUILD_DIR)/strset.o \
-	$(BUILD_DIR)/btf.o $(BUILD_DIR)/libbpf.o $(BUILD_DIR)/gen.o
+	$(BUILD_DIR)/btf.o $(BUILD_DIR)/libbpf.o $(BUILD_DIR)/gen.o $(BUILD_DIR)/usdt.o
 
 $(BUILD_DIR)/main.o: bpftool/main.c
 	gcc $(INCLUDE) -c -o $@ $^
@@ -24,6 +24,9 @@ $(BUILD_DIR)/libbpf.o: libbpf.c
 	gcc $(INCLUDE) -c -o $@ $^
 
 $(BUILD_DIR)/gen.o: bpftool/gen.c
+	gcc $(INCLUDE) -c -o $@ $^
+
+$(BUILD_DIR)/usdt.o: usdt.c
 	gcc $(INCLUDE) -c -o $@ $^
 
 $(BUILD_DIR)/bpftool: $(OBJS)

@@ -3,8 +3,19 @@
 #include <errno.h>
 
 #include "../libbpf.h"
+#include "../libbpf_legacy.h"
 
 #include "main.h"
+
+#define MAX_OBJ_NAME_LEN 64
+
+static int do_skeleton(int argc, char **argv)
+{
+	char header_guard[MAX_OBJ_NAME_LEN + sizeof("__SKEL_H__")];
+	size_t map_cnt = 0, prog_cnt = 0, file_sz, mmap_sz;
+	char obj_name[MAX_OBJ_NAME_LEN] = "", *obj_data;
+	struct bpf_object *obj = NULL;
+}
 
 static int do_object(int argc, char **argv)
 {
