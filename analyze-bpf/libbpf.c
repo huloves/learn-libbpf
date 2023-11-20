@@ -168,14 +168,35 @@ enum reloc_type {
 	RELO_CORE,
 };
 
+/**
+ * reloc_desc - 重定位描述符
+ */
 struct reloc_desc {
+	/**
+	 * 重定位类型
+	 */
 	enum reloc_type type;
+	/**
+	 * 指令索引，需要重定位的指定在程序的位置
+	 */
 	int insn_idx;
+	/**
+	 * 根据type的值选择不同的成员
+	 */
 	union {
 		const struct bpf_core_relo *core_relo; /* used when type == RELO_CORE */
 		struct {
+			/**
+			 * 映射索引，表示需要重定位的映射在程序中的位置
+			 */
 			int map_idx;
+			/**
+			 * 符号偏移量，表示需要重定位的符号相对于其定义的位置的偏移量
+			 */
 			int sym_off;
+			/**
+			 * 外部索引，表示需要重定位的外部符号在外部符号表中的位置
+			 */
 			int ext_idx;
 		};
 	};
@@ -186,9 +207,18 @@ enum sec_def_flags {
 	SEC_NONE = 0,
 };
 
+/**
+ * bpf_sec_def - 描述一个BPF section
+ */
 struct bpf_sec_def {
 	char *sec;
+	/**
+	 * BPF程序类型
+	 */
 	enum bpf_prog_type prog_type;
+	/**
+	 * BPF程序预期的附加类型
+	 */
 	enum bpf_attach_type expected_attach_type;
 	long cookie;
 	int handler_id;
