@@ -31,6 +31,8 @@
 #define HELP_SPEC_LINK							\
 	"LINK := { id LINK_ID | pinned FILE }"
 
+bool is_prefix(const char *pfx, const char *str);
+
 void usage(void);
 
 extern const char *bin_name;
