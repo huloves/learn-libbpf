@@ -209,6 +209,10 @@ enum sec_def_flags {
 
 /**
  * bpf_sec_def - 描述一个BPF section
+ * 描述BPF节属性和相关操作，可以帮助用户：
+ * 1. 设置BPF程序的特性
+ * 2. 准备加载
+ * 3. 将BPF程序附加到指定位置
  */
 struct bpf_sec_def {
 	char *sec;
