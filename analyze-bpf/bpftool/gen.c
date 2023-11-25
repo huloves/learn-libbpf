@@ -1,8 +1,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
+#include <libgen.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <linux/kernel.h>
 
 #include "../libbpf.h"
@@ -12,6 +17,44 @@
 
 #define MAX_OBJ_NAME_LEN 64
 
+static void sanitize_identifier(char *name)
+{
+	int i;
+	
+	for (i = 0; name[i]; i++)
+		if (!isalnum(name[i]) && name[i] != '_')
+			name[i] = '_';
+}
+
+static bool str_has_prefix(const char *str, const char *prefix)
+{
+	return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
+static bool str_has_suffix(const char *str, const char *suffix)
+{
+	size_t i, n1 = strlen(str), n2 = strlen(suffix);
+
+	if (n1 < n2)
+		return false;
+	
+	for (i = 0; i < n2; i++)
+		if (str[n1 - i - 1] != suffix[n2 - i - 1])
+			return false;
+
+	return true;
+}
+
+static void get_obj_name(char *name, const char *file)
+{
+	/* Using basename() GNU version which doesn't modify arg. */
+	strncpy(name, basename(file), MAX_OBJ_NAME_LEN - 1);
+	name[MAX_OBJ_NAME_LEN - 1] = '\0';
+	if (str_has_suffix(name, ".o"))
+		name[strlen(name) - 2] = '\0';
+	sanitize_identifier(name);
+}
+
 /**
  * bpftool gen skeleton xxx.bpf.o > xxx.skel.h
  */
@@ -19,6 +62,7 @@ static int do_skeleton(int argc, char **argv)
 {
 	char header_guard[MAX_OBJ_NAME_LEN + sizeof("__SKEL_H__")];
 	size_t map_cnt = 0, prog_cnt = 0, file_sz, mmap_sz;
+	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
 	char obj_name[MAX_OBJ_NAME_LEN] = "", *obj_data;
 	struct bpf_object *obj = NULL;
 	const char *file;
@@ -65,6 +109,20 @@ static int do_skeleton(int argc, char **argv)
 	}
 	file_sz = st.st_size;
 	mmap_sz = roundup(file_sz, sysconf(_SC_PAGE_SIZE));
+	fd = open(file, O_RDONLY);
+	if (fd < 0) {
+		printf("failed to open() %s: %s\n", file, strerror(errno));
+		return -1;
+	}
+	obj_data = mmap(NULL, mmap_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (obj_data == MAP_FAILED) {
+		obj_data = NULL;
+		printf("failed to mmap() %s: %s\n", file, strerror(errno));
+	}
+	if (obj_name[0] == '\0') {
+		get_obj_name(obj_name, file);
+	}
+	opts.object_name = obj_name;
 }
 
 static int do_object(int argc, char **argv)
