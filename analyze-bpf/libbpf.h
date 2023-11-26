@@ -11,6 +11,10 @@ extern "C" {
 
 enum libbpf_errno {
 	__LIBBPF_ERRNO__START = 4000,
+
+	/* Something wrong in libelf */
+	LIBBPF_ERRNO__LIBELF = __LIBBPF_ERRNO__START,
+	LIBBPF_ERRNO__FORMAT,	/* BPF object format invalid */
 	__LIBBPF_ERRNO__END,
 };
 
@@ -98,6 +102,20 @@ struct bpf_object_open_opts {
 	size_t :0;
 };
 #define bpf_object_open_opts__last_field kernel_log_level
+
+/**
+ * @brief **bpf_object__open_mem()** creates a bpf_object by reading
+ * the BPF objects raw bytes from a memory buffer containing a valid
+ * BPF ELF object file.
+ * @param obj_buf pointer to the buffer containing ELF file bytes
+ * @param obj_buf_sz number of bytes in the buffer
+ * @param opts options for how to load the bpf object
+ * @return pointer to the new bpf_object; or NULL is returned on error,
+ * error code is stored in errno
+ */
+struct bpf_object *
+bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
+		     const struct bpf_object_open_opts *opts);
 
 /* Accessors of bpf_program */
 struct bpf_program;

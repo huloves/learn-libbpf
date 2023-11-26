@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -5,6 +8,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <libgen.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -123,6 +127,11 @@ static int do_skeleton(int argc, char **argv)
 		get_obj_name(obj_name, file);
 	}
 	opts.object_name = obj_name;
+	if (verifier_logs) {
+		/* log_level1 + log_level2 + stats, but not stable UAPI */
+		opts.kernel_log_level = 1 + 2 + 4;
+	}
+	obj = bpf_object__open_mem(obj_data, file_sz, &opts);
 }
 
 static int do_object(int argc, char **argv)

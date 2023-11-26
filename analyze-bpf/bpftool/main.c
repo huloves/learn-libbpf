@@ -13,6 +13,7 @@ const char *bin_name;
 static int last_argc;
 static char **last_argv;
 static int (*last_do_help)(int argc, char **argv);
+bool verifier_logs;
 
 void usage(void)
 {

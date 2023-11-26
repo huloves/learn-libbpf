@@ -1,8 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <linux/err.h>
 #include <errno.h>
+#include <gelf.h>
 #include <sys/resource.h>
+
+#include "str_error.h"
 #include "libbpf.h"
 #include "btf.h"
 #include "libbpf_internal.h"
@@ -548,6 +554,155 @@ struct bpf_object {
 	char path[];
 };
 
+static struct bpf_object *bpf_object__new(const char *path,
+					  const void *obj_buf,
+					  size_t obj_buf_sz,
+					  const char *obj_name)
+{
+	struct bpf_object *obj;
+	char *end;
+
+	obj = calloc(1, sizeof(struct bpf_object) + strlen(path) + 1);
+	if (!obj) {
+		printf("alloc memory failed for %s\n", path);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	strcpy(obj->path, path);
+	if (obj_name) {
+		libbpf_strlcpy(obj->name, obj_name, sizeof(obj->name));
+	} else {
+		/* Using basename() GNU version which doesn't modify arg. */
+		libbpf_strlcpy(obj->name, basename((void *)path), sizeof(obj->name));
+		end = strchr(obj->name, '.');
+		if (end)
+			*end = 0;
+	}
+
+	obj->efile.fd = -1;
+	/**
+	 * Caller of this function should also call
+	 * bpf_object__elf_finish() after data collection to return
+	 * obj_buf to user. if not, we should duplicate the buffer to
+	 * avoid user freeing them before elf finish.
+	 */
+	obj->efile.obj_buf = obj_buf;
+	obj->efile.obj_buf_sz = obj_buf_sz;
+	obj->efile.btf_maps_shndx = -1;
+	obj->efile.st_ops_shndx = -1;
+	obj->efile.st_ops_link_shndx = -1;
+	obj->kconfig_map_idx = -1;
+
+	obj->kern_version = get_kernel_version();
+	obj->loaded = false;
+
+	return obj;
+}
+
+static void bpf_object__elf_finish(struct bpf_object *obj)
+{
+	if (!obj->efile.elf)
+		return;
+
+	elf_end(obj->efile.elf);
+	obj->efile.elf = NULL;
+	obj->efile.symbols = NULL;
+	obj->efile.st_ops_data = NULL;
+	obj->efile.st_ops_link_data = NULL;
+
+	zfree(&obj->efile.secs);
+	obj->efile.sec_cnt = 0;
+	zclose(obj->efile.fd);
+	obj->efile.obj_buf = NULL;
+	obj->efile.obj_buf_sz = 0;
+}
+
+/**
+ * bpf_object__elf_init - 初始化obj->efile结构中与ELF相关的内容并进行检查
+ */
+static int bpf_object__elf_init(struct bpf_object *obj)
+{
+	Elf64_Ehdr *ehdr;
+	int err = 0;
+	Elf *elf;
+	
+	if (obj->efile.elf) {
+		printf("elf: init internal error\n");
+		return -LIBBPF_ERRNO__LIBELF;
+	}
+	
+	if (obj->efile.obj_buf_sz > 0) {
+		/* obj_buf should have been validated by bpf_object__open_mem(). */
+		elf = elf_memory((char *)obj->efile.obj_buf, obj->efile.obj_buf_sz);
+	} else {
+		obj->efile.fd = open(obj->path, O_RDONLY | O_CLOEXEC);
+		if (obj->efile.fd < 0) {
+			char errmsg[STRERR_BUFSIZE], *cp;
+
+			err = -errno;
+			cp = libbpf_strerror_r(err, errmsg, sizeof(errmsg));
+			printf("elf: failed to open %s: %s\n", obj->path, cp);
+			return err;
+		}
+
+		elf = elf_begin(obj->efile.fd, ELF_C_READ_MMAP, NULL);
+	}
+
+	if (!elf) {
+		printf("elf: failed to open %s as ELF file: %s\n", obj->path, elf_errmsg(-1));
+		err = -LIBBPF_ERRNO__LIBELF;
+		goto errout;
+	}
+
+	obj->efile.elf = elf;
+
+	if (elf_kind(elf) != ELF_K_ELF) {
+		err = -LIBBPF_ERRNO__FORMAT;
+		printf("elf: '%s' is not a proper ELF object\n", obj->path);
+		goto errout;
+	}
+	
+	if (gelf_getclass(elf) != ELFCLASS64) {
+		err = -LIBBPF_ERRNO__FORMAT;
+		printf("elf: '%s' is not a 64-bit ELF object\n", obj->path);
+		goto errout;
+	}
+
+	obj->efile.ehdr = ehdr = elf64_getehdr(elf);
+	if (!obj->efile.ehdr) {
+		printf("elf: failed to get ELF header from %s: %s\n", obj->path, elf_errmsg(-1));
+		err = -LIBBPF_ERRNO__FORMAT;
+		goto errout;
+	}
+
+	if (elf_getshdrstrndx(elf, &obj->efile.shstrndx)) {
+		printf("elf: failed to get section names section index for %s: %s\n",
+			obj->path, elf_errmsg(-1));
+		err = -LIBBPF_ERRNO__FORMAT;
+		goto errout;
+	}
+
+	/* ELF is corrupted/truncated, avoid calling elf_strptr. */
+	if (!elf_rawdata(elf_getscn(elf, obj->efile.shstrndx), NULL)) {
+		printf("elf: failed to get section names strings from %s: %s\n",
+			obj->path, elf_errmsg(-1));
+		err = -LIBBPF_ERRNO__FORMAT;
+		goto errout;
+	}
+
+	/* Old LLVM set e_machine to EM_NONE */
+	if (ehdr->e_type != ET_REL || (ehdr->e_machine && ehdr->e_machine != EM_BPF)) {
+		printf("elf: %s is not a valid eBPF object file\n", obj->path);
+		err = -LIBBPF_ERRNO__FORMAT;
+		goto errout;
+	}
+
+	return 0;
+errout:
+	bpf_object__elf_finish(obj);
+	return err;
+}
+
 static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 {
 	if (type == BPF_MAP_TYPE_ARRAY_OF_MAPS ||
@@ -884,4 +1039,87 @@ int parse_btf_map_def(const char *map_name, struct btf *btf,
 	}
 
 	return 0;
+}
+
+static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf, size_t obj_buf_sz,
+					  const struct bpf_object_open_opts *opts)
+{
+	const char *obj_name, *kconfig, *btf_tmp_path;
+	struct bpf_object *obj;
+	char tmp_name[64];
+	char err;
+	char *log_buf;
+	size_t log_size;
+	__u32 log_level;
+
+	if (elf_version(EV_CURRENT) == EV_NONE) {
+		printf("failed to inint libelf for %s\n", path ? path : "mem buf");
+		return ERR_PTR(-LIBBPF_ERRNO__LIBELF);
+	}
+
+	if (!OPTS_VALID(opts, bpf_object_open_opts))
+		return ERR_PTR(-EINVAL);
+
+	obj_name = OPTS_GET(opts, object_name, NULL);
+	if (obj_buf) {
+		if (!obj_name) {
+			snprintf(tmp_name, sizeof(tmp_name), "%lx-%lx",
+				 (unsigned long)obj_buf,
+				 (unsigned long)obj_buf_sz);
+		}
+		path = obj_name;
+		printf("loading object '%s' from buffer\n", obj_name);
+	}
+
+	log_buf = OPTS_GET(opts, kernel_log_buf, NULL);
+	log_size = OPTS_GET(opts, kernel_log_size, 0);
+	log_level = OPTS_GET(opts, kernel_log_level, 0);
+	if (log_size > UINT_MAX)
+		return ERR_PTR(-EINVAL);
+	if (log_size && !log_buf)
+		return ERR_PTR(-EINVAL);
+	
+	obj = bpf_object__new(path, obj_buf, obj_buf_sz, obj_name);
+	if (IS_ERR(obj))
+		return obj;
+
+	obj->log_buf = log_buf;
+	obj->log_size = log_size;
+	obj->log_level = log_level;
+
+	btf_tmp_path = OPTS_GET(opts, btf_custom_path, NULL);
+	if (btf_tmp_path) {
+		if (strlen(btf_tmp_path) >= PATH_MAX) {
+			err = -ENAMETOOLONG;
+			goto out;
+		}
+		obj->btf_custom_path = strdup(btf_tmp_path);
+		if (!obj->btf_custom_path) {
+			err = -ENOMEM;
+			goto out;
+		}
+	}
+
+	kconfig = OPTS_GET(opts, kconfig, NULL);
+	if (kconfig) {
+		obj->kconfig = strdup(kconfig);
+		if (!obj->kconfig) {
+			err = -ENOMEM;
+			goto out;
+		}
+	}
+
+	err = bpf_object__elf_init(obj);
+out:
+	return NULL;
+}
+
+struct bpf_object *
+bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
+		     const struct bpf_object_open_opts *opts)
+{
+	if (!obj_buf || obj_buf_sz == 0)
+		return libbpf_err_ptr(-EINVAL);
+
+	return libbpf_ptr(bpf_object_open(NULL, obj_buf, obj_buf_sz, opts));
 }
