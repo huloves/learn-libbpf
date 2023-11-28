@@ -554,6 +554,16 @@ struct bpf_object {
 	char path[];
 };
 
+static const char *elf_sym_str(const struct bpf_object *obj, size_t off);
+static const char *elf_sec_str(const struct bpf_object *obj, size_t off);
+static Elf_Scn *elf_sec_by_idx(const struct bpf_object *obj, size_t idx);
+static Elf_Scn *elf_sec_by_name(const struct bpf_object *obj, const char *name);
+static Elf64_Shdr *elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn);
+static const char *elf_sec_name(const struct bpf_object *obj, Elf_Scn *scn);
+static Elf_Data *elf_sec_data(const struct bpf_object *obj, Elf_Scn *scn);
+static Elf64_Sym *elf_sym_by_idx(const struct bpf_object *obj, size_t idx);
+static Elf64_Rel *elf_rel_by_idx(Elf_Data *data, size_t idx);
+
 static struct bpf_object *bpf_object__new(const char *path,
 					  const void *obj_buf,
 					  size_t obj_buf_sz,
@@ -756,6 +766,70 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
+static const char *elf_sym_str(const struct bpf_object *obj, size_t off)
+{
+	const char *name;
+
+	name = elf_strptr(obj->efile.elf, obj->efile.strtabidx, off);
+	if (!name) {
+		printf("elf: failed to get section name string at offset %zu from %s: %s\n",
+			off, obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+
+	return name;
+}
+
+static const char *elf_sec_str(const struct bpf_object *obj, size_t off)
+{
+	const char *name;
+
+	name = elf_strptr(obj->efile.elf, obj->efile.shstrndx, off);
+	if (!name) {
+		printf("elf: failed to get section name string at offset %zu from %s: %s\n",
+			off, obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+
+	return name;
+}
+
+static Elf_Scn *elf_sec_by_idx(const struct bpf_object *obj, size_t idx)
+{
+	Elf_Scn *scn;
+
+	scn = elf_getscn(obj->efile.elf, idx);
+	if (!scn) {
+		printf("elf: failed to get section(%zu) from %s: %s\n",
+			idx, obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+	return scn;
+}
+
+static Elf_Scn *elf_sec_by_name(const struct bpf_object *obj, const char *name)
+{
+	Elf_Scn *scn = NULL;
+	Elf *elf = obj->efile.elf;
+	const char *sec_name;
+
+	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		sec_name = elf_sec_name(obj, scn);
+		if (!sec_name)
+			return NULL;
+
+		if (strcmp(sec_name, name) != 0)
+			continue;
+
+		return scn;
+	}
+	return NULL;
+}
+
+/**
+ * elf_sec_hdr - get elf section's header
+ * @scn: 要获取section header的section
+ */
 static Elf64_Shdr *elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn)
 {
 	Elf64_Shdr *shdr;
@@ -771,6 +845,68 @@ static Elf64_Shdr *elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn)
 	}
 
 	return shdr;
+}
+
+static const char *elf_sec_name(const struct bpf_object *obj, Elf_Scn *scn)
+{
+	const char *name;
+	Elf64_Shdr *sh;
+
+	if (!scn)
+		return NULL;
+
+	sh = elf_sec_hdr(obj, scn);
+	if (!sh)
+		return NULL;
+
+	name = elf_sec_str(obj, sh->sh_name);
+	if (!name) {
+		printf("elf: failed to get section(%zu) name from %s: %s\n",
+			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+
+	return name;
+}
+
+static Elf_Data *elf_sec_data(const struct bpf_object *obj, Elf_Scn *scn)
+{
+	Elf_Data *data;
+
+	if (!scn)
+		return NULL;
+
+	data = elf_getdata(scn, 0);
+	if (!data) {
+		printf("elf: failed to get section(%zu) %s data from %s: %s\n",
+			elf_ndxscn(scn), elf_sec_name(obj, scn) ?: "<?>",
+			obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+
+	return data;
+}
+
+static Elf64_Sym *elf_sym_by_idx(const struct bpf_object *obj, size_t idx)
+{
+	if (idx >= obj->efile.symbols->d_size / sizeof(Elf64_Sym))
+		return NULL;
+
+	return (Elf64_Sym *)obj->efile.symbols->d_buf + idx;
+}
+
+static Elf64_Rel *elf_rel_by_idx(Elf_Data *data, size_t idx)
+{
+	if (idx >= data->d_size / sizeof(Elf64_Rel))
+		return NULL;
+
+	return (Elf64_Rel *)data->d_buf + idx;
+}
+
+static bool is_sec_name_dwarf(const char *name)
+{
+	/* approximation, but the actual list is too long */
+	return str_has_pfx(name, ".debug_");
 }
 
 static int bpf_object__elf_collect(struct bpf_object *obj)
@@ -802,8 +938,14 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 	/* a bunch of elf parsing functionality depends on processing symbols,
 	 * so do the first pass and find the symbol table
 	 */
+	/**
+	 * 遍历每一个seciton，找到符号表(symbol table)
+	 */
 	scn = NULL;
 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		/**
+		 * 获取section的header
+		 */
 		sh = elf_sec_hdr(obj, scn);
 		if (!sh)
 			return -LIBBPF_ERRNO__FORMAT;
@@ -824,6 +966,26 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			obj->efile.symbols_shndx = idx;
 			obj->efile.strtabidx = sh->sh_link;
 		}
+	}
+
+	if (!obj->efile.symbols) {
+		printf("elf: couldn't find symbol table in %s, stripped object file?\n",
+			obj->path);
+		return -ENOENT;
+	}
+
+	scn = NULL;
+	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		idx = elf_ndxscn(scn);
+		sec_desc = &obj->efile.secs[idx];
+
+		sh = elf_sec_hdr(obj, scn);
+		if (!sh)
+			return -LIBBPF_ERRNO__FORMAT;
+
+		name = elf_sec_str(obj, sh->sh_name);
+		if (!name)
+			return -LIBBPF_ERRNO__FORMAT;
 	}
 }
 
