@@ -756,6 +756,77 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
+static Elf64_Shdr *elf_sec_hdr(const struct bpf_object *obj, Elf_Scn *scn)
+{
+	Elf64_Shdr *shdr;
+
+	if (!scn)
+		return NULL;
+
+	shdr = elf64_getshdr(scn);
+	if (!shdr) {
+		printf("elf: failed to get section(%zu) header from %s: %s\n",
+			elf_ndxscn(scn), obj->path, elf_errmsg(-1));
+		return NULL;
+	}
+
+	return shdr;
+}
+
+static int bpf_object__elf_collect(struct bpf_object *obj)
+{
+	struct elf_sec_desc *sec_desc;
+	Elf *elf = obj->efile.elf;
+	Elf_Data *btf_ext_data = NULL;
+	Elf_Data *btf_data = NULL;
+	int idx = 0, err = 0;
+	const char *name;
+	Elf_Data *data;
+	Elf_Scn *scn;
+	Elf64_Shdr *sh;
+
+	/* ELF section indices are 0-based, but sec #0 is special "invalid"
+	 * section. Since section count retrieved by elf_getshdrnum() does
+	 * include sec #0, it is already the necessary size of an array to keep
+	 * all the sections.
+	 */
+	if (elf_getshdrnum(obj->efile.elf, &obj->efile.sec_cnt)) {
+		printf("elf: failed to get the number of sections for %s: %s\n",
+			obj->path, elf_errmsg(-1));
+		return -LIBBPF_ERRNO__FORMAT;
+	}
+	obj->efile.secs = calloc(obj->efile.sec_cnt, sizeof(*obj->efile.secs));
+	if (!obj->efile.secs)
+		return -ENOMEM;
+
+	/* a bunch of elf parsing functionality depends on processing symbols,
+	 * so do the first pass and find the symbol table
+	 */
+	scn = NULL;
+	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		sh = elf_sec_hdr(obj, scn);
+		if (!sh)
+			return -LIBBPF_ERRNO__FORMAT;
+
+		if (sh->sh_type == SHT_SYMTAB) {
+			if (obj->efile.symbols) {
+				printf("elf: multiple symbol tables in %s\n", obj->path);
+				return -LIBBPF_ERRNO__FORMAT;
+			}
+
+			data = elf_sec_data(obj, scn);
+			if (!data)
+				return -LIBBPF_ERRNO__FORMAT;
+
+			idx = elf_ndxscn(scn);
+
+			obj->efile.symbols = data;
+			obj->efile.symbols_shndx = idx;
+			obj->efile.strtabidx = sh->sh_link;
+		}
+	}
+}
+
 long libbpf_get_error(const void *ptr)
 {
 	if (!IS_ERR_OR_NULL(ptr))
