@@ -51,6 +51,7 @@ struct btf *btf__new_empty(void);
 
 __u32 btf__type_cnt(const struct btf *btf);
 const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+int btf__set_pointer_size(struct btf *btf, size_t ptr_sz);
 __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
 const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
 const void *btf__raw_data(const struct btf *btf, __u32 *size);

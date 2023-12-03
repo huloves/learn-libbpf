@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 // #include <linux/btf.h>
 #include <linux/bpf.h>
 #include <linux/errno.h>
@@ -653,6 +654,17 @@ const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 type_id)
 	if (type_id >= btf->start_id + btf->nr_types)
 		return errno = EINVAL, NULL;
 	return btf_type_by_id((struct btf *)btf, type_id);
+}
+
+/* Override or set pointer size in bytes. Only values of 4 and 8 are
+ * supported.
+ */
+int btf__set_pointer_size(struct btf *btf, size_t ptr_sz)
+{
+	if (ptr_sz != 4 && ptr_sz != 8)
+		return libbpf_err(-EINVAL);
+	btf->ptr_sz = ptr_sz;
+	return 0;
 }
 
 static bool btf_is_modifiable(const struct btf *btf)

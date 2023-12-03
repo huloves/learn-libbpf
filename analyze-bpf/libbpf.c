@@ -15,6 +15,7 @@
 #include "libbpf_legacy.h"
 #include "libbpf_version.h"
 
+#include "include/linux/kernel.h"
 #include "include/uapi/linux/bpf.h"
 #include "include/uapi/linux/btf.h"
 
@@ -564,6 +565,234 @@ static Elf_Data *elf_sec_data(const struct bpf_object *obj, Elf_Scn *scn);
 static Elf64_Sym *elf_sym_by_idx(const struct bpf_object *obj, size_t idx);
 static Elf64_Rel *elf_rel_by_idx(Elf_Data *data, size_t idx);
 
+void bpf_program__unload(struct bpf_program *prog)
+{
+	if (!prog)
+		return;
+
+	zclose(prog->fd);
+
+	zfree(&prog->func_info);
+	zfree(&prog->line_info);
+}
+
+static void bpf_program__exit(struct bpf_program *prog)
+{
+	if (!prog)
+		return;
+
+	bpf_program__unload(prog);
+	zfree(&prog->name);
+	zfree(&prog->sec_name);
+	zfree(&prog->insns);
+	zfree(&prog->reloc_desc);
+
+	prog->nr_reloc = 0;
+	prog->insns_cnt = 0;
+	prog->sec_idx = -1;
+}
+
+/**
+ * bpf_object__init_prog - 初始化bpf_program
+ * @obj: 指向需要进行初始化的bpf_program所属bpf_object
+ * @prog: 需要进行初始化的bpf_program
+ * @name: program名字
+ * @sec_idx: program section索引
+ * @sec_name: program所属section的name
+ * @sec_off: program的偏移
+ * @insn_data: program指令起始地址
+ * @insn_data_sz: program指令大小，以字节为单位
+ */
+static int
+bpf_object__init_prog(struct bpf_object *obj, struct bpf_program *prog,
+		      const char *name, size_t sec_idx, const char *sec_name,
+		      size_t sec_off, void *insn_data, size_t insn_data_sz)
+{
+	/**
+	 * 进行必要的参数检:
+	 * 1. 指令大小为0，返回-EINVAL
+	 * 2. 指令大小不是bpf_insn整数倍，返回-EINVAL
+	 * 3. program在seciton中的偏移不是bpf_insn的整数倍，返回-EINVAL
+	 */
+	if (insn_data_sz == 0 || insn_data_sz % BPF_INSN_SZ || sec_off % BPF_INSN_SZ) {
+		printf("sec '%s': corrupted program '%s', offset %zu, size %zu\n",
+			sec_name, name, sec_off, insn_data_sz);
+		return -EINVAL;
+	}
+
+	memset(prog, 0, sizeof(*prog));
+	prog->obj = obj;
+
+	prog->sec_idx = sec_idx;
+	prog->sec_insn_off = sec_off / BPF_INSN_SZ;
+	prog->sec_insn_cnt = insn_data_sz / BPF_INSN_SZ;
+	/* insns_cnt can later be increased by appending used subprograms */
+	prog->insns_cnt = prog->sec_insn_cnt;
+
+	/**
+	 * 初始化BPF程序类型
+	 */
+	prog->type = BPF_PROG_TYPE_UNSPEC;
+	prog->fd = -1;
+	prog->exception_cb_idx = -1;
+
+	/* libbpf's convention for SEC("?abc...") is that it's just like
+	 * SEC("abc...") but the corresponding bpf_program starts out with
+	 * autoload set to false.
+	 */
+	/**
+	 * libbpf对SEC("?abc...")的约定是:
+	 * 它与SEC("abc...")相同，但对应的bpf_program的autoload属性设置为false
+	 */
+	if (sec_name[0] == '?') {
+		prog->autoload = false;
+		/* from now on forget there was ? in section name */
+		sec_name++;
+	} else {
+		prog->autoload = true;
+	}
+
+	prog->autoattach = true;
+
+	/* inherit object's log_level */
+	prog->log_level = obj->log_level;
+
+	prog->sec_name = strdup(sec_name);
+	if (!prog->sec_name)
+		goto errout;
+
+	prog->name = strdup(name);
+	if (!prog->name)
+		goto errout;
+
+	prog->insns = malloc(insn_data_sz);
+	if (!prog->insns)
+		goto errout;
+	memcpy(prog->insns, insn_data, insn_data_sz);
+
+	return 0;
+errout:
+	printf("sec '%s': failed to allocate memory for prog '%s'\n", sec_name, name);
+	bpf_program__exit(prog);
+	return -ENOMEM;
+}
+
+/**
+ * bpf_object__add_programs - bpf_object中添加代码section
+ * @obj: 指向bpf_object
+ * @sec_data: program section的数据部分
+ * @sec_name: program section的名字
+ * @sec_idx: program section的索引
+ */
+static int
+bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
+			 const char *sec_name, int sec_idx)
+{
+	Elf_Data *symbols = obj->efile.symbols;
+	struct bpf_program *prog, *progs;
+	void *data = sec_data->d_buf;
+	size_t sec_sz = sec_data->d_size, sec_off, prog_sz, nr_syms;
+	int nr_progs, err, i;
+	const char *name;
+	Elf64_Sym *sym;
+
+	progs = obj->programs;
+	nr_progs = obj->nr_programs;
+	nr_syms = symbols->d_size / sizeof(Elf64_Sym);
+
+	/**
+	 * 遍历每一个符号
+	 */
+	for (i = 0; i < nr_syms; i++) {
+		/**
+		 * 通过符号索引找到符号表项
+		 */
+		sym = elf_sym_by_idx(obj, i);
+		/**
+		 * 符号若不是code object，跳过
+		 */
+		if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC)
+			continue;
+		
+		prog_sz = sym->st_size;
+		sec_off = sym->st_value;
+
+		/**
+		 * 获取string name
+		 */
+		name = elf_sym_str(obj, sym->st_name);
+		if (!name) {
+			printf("sec '%s': failed to get symbol name for offset %zu\n",
+				sec_name, sec_off);
+			return -LIBBPF_ERRNO__FORMAT;
+		}
+
+		if (sec_off + prog_sz > sec_sz) {
+			printf("sec '%s': program at offset %zu crosses section boundary\n",
+				sec_name, sec_off);
+			return -LIBBPF_ERRNO__FORMAT;
+		}
+
+		if (sec_idx != obj->efile.text_shndx && ELF64_ST_BIND(sym->st_info) == STB_LOCAL) {
+			printf("sec '%s': program '%s' is static and not supported\n", sec_name, name);
+			return -ENOTSUP;
+		}
+
+		printf("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
+			 sec_name, name, sec_off / BPF_INSN_SZ, sec_off, prog_sz / BPF_INSN_SZ, prog_sz);
+		
+		/**
+		 * 分配bpf_program结构体
+		 */
+		progs = libbpf_reallocarray(progs, nr_progs + 1, sizeof(*progs));
+		if (!progs) {
+			/*
+			 * In this case the original obj->programs
+			 * is still valid, so don't need special treat for
+			 * bpf_close_object().
+			 */
+			printf("sec '%s': failed to alloc memory for new program '%s'\n",
+				sec_name, name);
+			return -ENOMEM;
+		}
+
+		/**
+		 * 指向新增的bpf_program
+		 */
+		prog = &progs[nr_progs];
+
+		/**
+		 * 初始化新增的bpf_program
+		 */
+		err = bpf_object__init_prog(obj, prog, name, sec_idx, sec_name,
+					    sec_off, data + sec_off, prog_sz);
+		if (err)
+			return err;
+		
+		if (ELF64_ST_BIND(sym->st_info) != STB_LOCAL)
+			prog->sym_global = true;
+		
+		/* if function is a global/weak symbol, but has restricted
+		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF FUNC
+		 * as static to enable more permissive BPF verification mode
+		 * with more outside context available to BPF verifier
+		 */
+		/**
+		 * 如果函数是全局/弱符号，但具有受限的可见性（STV_HIDDEN或STV_INTERNAL），
+		 * 将其BTF FUNC标记为static，以启用更宽松的BPF验证模式，
+		 * 并使BPF验证器具备更多外部上下文可用性。
+		 */
+		if (prog->sym_global && (ELF64_ST_VISIBILITY(sym->st_other) == STV_HIDDEN
+		    || ELF64_ST_VISIBILITY(sym->st_other) == STV_INTERNAL))
+			prog->mark_btf_static = true;
+
+		nr_progs++;
+		obj->nr_programs = nr_progs;
+	}
+
+	return 0;
+}
+
 static struct bpf_object *bpf_object__new(const char *path,
 					  const void *obj_buf,
 					  size_t obj_buf_sz,
@@ -766,6 +995,116 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
+static bool section_have_execinstr(struct bpf_object *obj, int idx)
+{
+	Elf64_Shdr *sh;
+
+	sh = elf_sec_hdr(obj, elf_sec_by_idx(obj, idx));
+	if (!sh)
+		return false;
+
+	return sh->sh_flags & SHF_EXECINSTR;
+}
+
+static bool libbpf_needs_btf(const struct bpf_object *obj)
+{
+	return obj->efile.btf_maps_shndx >= 0 ||
+	       obj->efile.st_ops_shndx >= 0 ||
+	       obj->efile.st_ops_link_shndx >= 0 ||
+	       obj->nr_extern > 0;
+}
+
+static bool kernel_needs_btf(const struct bpf_object *obj)
+{
+	return obj->efile.st_ops_shndx >= 0 || obj->efile.st_ops_link_shndx >= 0;
+}
+
+/**
+ * bpf_object__init_btf - 初始化bpf_object中的btf_object
+ * @obj: 指向bpf_object
+ * @btf_data: 指向btf_data
+ * @btf_ext_data: 指向btf_ext_data
+ */
+static int bpf_object__init_btf(struct bpf_object *obj,
+				Elf_Data *btf_data,
+				Elf_Data *btf_ext_data)
+{
+	int err = -ENOENT;
+
+	if (btf_data) {
+		obj->btf = btf__new(btf_data->d_buf, btf_data->d_size);
+		err = libbpf_get_error(obj->btf);
+		if (err) {
+			obj->btf = NULL;
+			printf("Error loading ELF section %s: %d.\n", BTF_ELF_SEC, err);
+			goto out;
+		}
+		/* enforce 8-byte pointers for BPF-targeted BTFs */
+		btf__set_pointer_size(obj->btf, 8);
+	}
+	if (btf_ext_data) {
+		struct btf_ext_info *ext_segs[3];
+		int seg_num, sec_num;
+
+		if (!obj->btf) {
+			printf("Ignore ELF section %s because its depending ELF section %s is not found.\n",
+				 BTF_EXT_ELF_SEC, BTF_ELF_SEC);
+			goto out;
+		}
+		obj->btf_ext = btf_ext__new(btf_ext_data->d_buf, btf_ext_data->d_size);
+		err = libbpf_get_error(obj->btf_ext);
+		if (err) {
+			printf("Error loading ELF section %s: %d. Ignored and continue.\n",
+				BTF_EXT_ELF_SEC, err);
+			obj->btf_ext = NULL;
+			goto out;
+		}
+
+		/* setup .BTF.ext to ELF section mapping */
+		ext_segs[0] = &obj->btf_ext->func_info;
+		ext_segs[1] = &obj->btf_ext->line_info;
+		ext_segs[2] = &obj->btf_ext->core_relo_info;
+		for (seg_num = 0; seg_num < ARRAY_SIZE(ext_segs); seg_num++) {
+			struct btf_ext_info *seg = ext_segs[seg_num];
+			const struct btf_ext_info_sec *sec;
+			const char *sec_name;
+			Elf_Scn *scn;
+
+			if (seg->sec_cnt == 0)
+				continue;
+
+			seg->sec_idxs = calloc(seg->sec_cnt, sizeof(*seg->sec_idxs));
+			if (!seg->sec_idxs) {
+				err = -ENOMEM;
+				goto out;
+			}
+
+			sec_num = 0;
+			for_each_btf_ext_sec(seg, sec) {
+				/* preventively increment index to avoid doing
+				 * this before every continue below
+				 */
+				sec_num++;
+
+				sec_name = btf__name_by_offset(obj->btf, sec->sec_name_off);
+				if (str_is_empty(sec_name))
+					continue;
+				scn = elf_sec_by_name(obj, sec_name);
+				if (!scn)
+					continue;
+
+				seg->sec_idxs[sec_num - 1] = elf_ndxscn(scn);
+			}
+		}
+	}
+out:
+	if (err && libbpf_needs_btf(obj)) {
+		printf("BTF is required, but is missing or corrupted.\n");
+		return err;
+	}
+	return 0;
+}
+
 static const char *elf_sym_str(const struct bpf_object *obj, size_t off)
 {
 	const char *name;
@@ -909,6 +1248,52 @@ static bool is_sec_name_dwarf(const char *name)
 	return str_has_pfx(name, ".debug_");
 }
 
+static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
+{
+	/* no special handling of .strtab */
+	if (hdr->sh_type == SHT_STRTAB)
+		return true;
+
+	/* ignore .llvm_addrsig section as well */
+	if (hdr->sh_type == SHT_LLVM_ADDRSIG)
+		return true;
+
+	/* no subprograms will lead to an empty .text section, ignore it */
+	if (hdr->sh_type == SHT_PROGBITS && hdr->sh_size == 0 &&
+	    strcmp(name, ".text") == 0)
+		return true;
+
+	/* DWARF sections */
+	if (is_sec_name_dwarf(name))
+		return true;
+
+	if (str_has_pfx(name, ".rel")) {
+		name += sizeof(".rel") - 1;
+		/* DWARF section relocations */
+		if (is_sec_name_dwarf(name))
+			return true;
+
+		/* .BTF and .BTF.ext don't need relocations */
+		if (strcmp(name, BTF_ELF_SEC) == 0 ||
+		    strcmp(name, BTF_EXT_ELF_SEC) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+static int cmp_progs(const void *_a, const void *_b)
+{
+	const struct bpf_program *a = _a;
+	const struct bpf_program *b = _b;
+
+	if (a->sec_idx != b->sec_idx)
+		return a->sec_idx < b->sec_idx ? -1 : 1;
+
+	/* sec_insn_off can't be the same within the section */
+	return a->sec_insn_off < b->sec_insn_off ? -1 : 1;
+}
+
 static int bpf_object__elf_collect(struct bpf_object *obj)
 {
 	struct elf_sec_desc *sec_desc;
@@ -986,7 +1371,115 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 		name = elf_sec_str(obj, sh->sh_name);
 		if (!name)
 			return -LIBBPF_ERRNO__FORMAT;
+
+		if (ignore_elf_section(sh, name))
+			continue;
+		
+		data = elf_sec_data(obj, scn);
+		if (!data)
+			return -LIBBPF_ERRNO__FORMAT;
+
+		printf("elf: section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+			 idx, name, (unsigned long)data->d_size,
+			 (int)sh->sh_link, (unsigned long)sh->sh_flags,
+			 (int)sh->sh_type);
+
+		if (strcmp(name, "license") == 0) {
+			/**
+			 * 初始化bpf_object的license成员
+			 */
+			err = bpf_object__init_license(obj, data->d_buf, data->d_size);
+			if (err)
+				return err;
+		} else if (strcmp(name, "maps") == 0) {
+			printf("elf: legacy map definitions in 'maps' section are not supported by libbpf v1.0+\n");
+			return -ENOTSUP;
+		} else if (strcmp(name, MAPS_ELF_SEC) == 0) {
+			/**
+			 * 记录btf_maps段的索引
+			 */
+			obj->efile.btf_maps_shndx = idx;
+		} else if (strcmp(name, BTF_ELF_SEC) == 0) {
+			if (sh->sh_type != SHT_PROGBITS)
+				return -LIBBPF_ERRNO__FORMAT;
+			/**
+			 * 记录btf section的数据
+			 */
+			btf_data = data;
+		} else if (sh->sh_type == SHT_PROGBITS && data->d_size > 0) {
+			if (sh->sh_flags & SHF_EXECINSTR) {
+				/**
+				 * 记录.text section的索引
+				 */
+				if (strcmp(name, ".text") == 0)
+					obj->efile.text_shndx = idx;
+				err = bpf_object__add_programs(obj, data, name, idx);
+				if (err)
+					return err;
+			} else if (strcmp(name, DATA_SEC) == 0 ||
+				   str_has_pfx(name, DATA_SEC ".")) {
+				sec_desc->sec_type = SEC_DATA;
+				sec_desc->shdr = sh;
+				sec_desc->data = data;
+			} else if (strcmp(name, RODATA_SEC) == 0 ||
+				   str_has_pfx(name, RODATA_SEC ".")) {
+				sec_desc->sec_type = SEC_RODATA;
+				sec_desc->shdr = sh;
+				sec_desc->data = data;
+			} else if (strcmp(name, STRUCT_OPS_SEC) == 0) {
+				obj->efile.st_ops_data = data;
+				obj->efile.st_ops_shndx = idx;
+			} else if (strcmp(name, STRUCT_OPS_LINK_SEC) == 0) {
+				obj->efile.st_ops_link_data = data;
+				obj->efile.st_ops_link_shndx = idx;
+			} else {
+				printf("elf: skipping unrecognized data section(%d) %s\n",
+					idx, name);
+			}
+		} else if (sh->sh_type == SHT_REL) {
+			int targ_sec_idx = sh->sh_info; /* points to other section */
+
+			if (sh->sh_entsize != sizeof(Elf64_Rel) ||
+			    targ_sec_idx >= obj->efile.sec_cnt)
+				return -LIBBPF_ERRNO__FORMAT;
+
+			/* Only do relo for section with exec instructions */
+			if (!section_have_execinstr(obj, targ_sec_idx) &&
+			    strcmp(name, ".rel" STRUCT_OPS_SEC) &&
+			    strcmp(name, ".rel" STRUCT_OPS_LINK_SEC) &&
+			    strcmp(name, ".rel" MAPS_ELF_SEC)) {
+				printf("elf: skipping relo section(%d) %s for section(%d) %s\n",
+					idx, name, targ_sec_idx,
+					elf_sec_name(obj, elf_sec_by_idx(obj, targ_sec_idx)) ?: "<?>");
+				continue;
+			}
+
+			sec_desc->sec_type = SEC_RELO;
+			sec_desc->shdr = sh;
+			sec_desc->data = data;
+		} else if (sh->sh_type == SHT_NOBITS && (strcmp(name, BSS_SEC) == 0 ||
+							 str_has_pfx(name, BSS_SEC "."))) {
+			sec_desc->sec_type = SEC_BSS;
+			sec_desc->shdr = sh;
+			sec_desc->data = data;
+		} else {
+			printf("elf: skipping section(%d) %s (size %zu)\n", idx, name,
+				(size_t)sh->sh_size);
+		}
 	}
+
+	if (!obj->efile.strtabidx || obj->efile.strtabidx > idx) {
+		printf("elf: symbol strings section missing or invalid in %s\n", obj->path);
+		return -LIBBPF_ERRNO__FORMAT;
+	}
+
+	/* sort BPF programs by section name and in-section instruction offset
+	 * for faster search
+	 */
+	if (obj->nr_programs)
+		qsort(obj->programs, obj->nr_programs, sizeof(*obj->programs), cmp_progs);
+
+	return bpf_object__init_btf(obj, btf_data, btf_ext_data);
 }
 
 long libbpf_get_error(const void *ptr)
@@ -1389,6 +1882,7 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 
 	err = bpf_object__elf_init(obj);
 	err = err ? : bpf_object__check_endianness(obj);
+	err = err ? : bpf_object__elf_collect(obj);
 out:
 	return NULL;
 }
