@@ -14,6 +14,7 @@
 #include "libbpf_internal.h"
 #include "libbpf_legacy.h"
 #include "libbpf_version.h"
+#include "relo_core.h"
 
 #include "include/linux/kernel.h"
 #include "include/uapi/linux/bpf.h"
@@ -995,6 +996,18 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
+static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
+					       const void *name)
+{
+	int i;
+
+	for (i = 0; i < obj->nr_extern; i++) {
+		if (strcmp(obj->externs[i].name, name) == 0)
+			return &obj->externs[i];
+	}
+	return NULL;
+}
+
 static bool section_have_execinstr(struct bpf_object *obj, int idx)
 {
 	Elf64_Shdr *sh;
@@ -1567,6 +1580,52 @@ static int find_extern_sec_btf_id(struct btf *btf, int ext_btf_id)
 	return -ENOENT;
 }
 
+static enum kcfg_type find_kcfg_type(const struct btf *btf, int id,
+				     bool *is_signed)
+{
+	const struct btf_type *t;
+	const char *name;
+
+	t = skip_mods_and_typedefs(btf, id, NULL);
+	name = btf__name_by_offset(btf, t->name_off);
+
+	if (is_signed)
+		*is_signed = false;
+	switch (btf_kind(t)) {
+	case BTF_KIND_INT: {
+		int enc = btf_int_encoding(t);
+
+		if (enc & BTF_INT_BOOL)
+			return t->size == 1 ? KCFG_BOOL : KCFG_UNKNOWN;
+		if (is_signed)
+			*is_signed = enc & BTF_INT_SIGNED;
+		if (t->size == 1)
+			return KCFG_CHAR;
+		if (t->size < 1 || t->size > 8 || (t->size & (t->size - 1)))
+			return KCFG_UNKNOWN;
+		return KCFG_INT;
+	}
+	case BTF_KIND_ENUM:
+		if (t->size != 4)
+			return KCFG_UNKNOWN;
+		if (strcmp(name, "libbpf_tristate"))
+			return KCFG_UNKNOWN;
+		return KCFG_TRISTATE;
+	case BTF_KIND_ENUM64:
+		if (strcmp(name, "libbpf_tristate"))
+			return KCFG_UNKNOWN;
+		return KCFG_TRISTATE;
+	case BTF_KIND_ARRAY:
+		if (btf_array(t)->nelems == 0)
+			return KCFG_UNKNOWN;
+		if (find_kcfg_type(btf, btf_array(t)->type, NULL) != KCFG_CHAR)
+			return KCFG_UNKNOWN;
+		return KCFG_CHAR_ARR;
+	default:
+		return KCFG_UNKNOWN;
+	}
+}
+
 static int cmp_externs(const void *_a, const void *_b)
 {
 	const struct extern_desc *a = _a;
@@ -1617,6 +1676,30 @@ static int add_dummy_ksym_var(struct btf *btf)
 					    BTF_KIND_DATASEC);
 	if (sec_btf_id < 0)
 		return 0;
+
+	sec = btf__type_by_id(btf, sec_btf_id);
+	vs = btf_var_secinfos(sec);
+	for (i = 0; i < btf_vlen(sec); i++, vs++) {
+		const struct btf_type *vt;
+
+		vt = btf__type_by_id(btf, vs->type);
+		if (btf_is_func(vt))
+			break;
+	}
+
+	/* No func in ksyms sec.  No need to add dummy var. */
+	if (i == btf_vlen(sec))
+		return 0;
+
+	int_btf_id = find_int_btf_id(btf);
+	dummy_var_btf_id = btf__add_var(btf,
+					"dummy_ksym",
+					BTF_VAR_GLOBAL_ALLOCATED,
+					int_btf_id);
+	if (dummy_var_btf_id < 0)
+		printf("cannot create a dummy_ksym var\n");
+
+	return dummy_var_btf_id;
 }
 
 static int bpf_object__collect_externs(struct bpf_object *obj)
@@ -1638,9 +1721,204 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 	if (!sh || sh->sh_entsize != sizeof(Elf64_Sym))
 		return -LIBBPF_ERRNO__FORMAT;
 	
-	// dummy_var_btf_id = add_dummy_ksym_var(obj->btf);
+	dummy_var_btf_id = add_dummy_ksym_var(obj->btf);
 	if (dummy_var_btf_id < 0)
 		return dummy_var_btf_id;
+	
+	n = sh->sh_size / sh->sh_entsize;
+	printf("looking for externs among %d symbols...\n", n);
+
+	for (i = 0; i < n; i++) {
+		Elf64_Sym *sym = elf_sym_by_idx(obj, i);
+
+		if (!sym)
+			return -LIBBPF_ERRNO__FORMAT;
+		if (!sym_is_extern(sym))
+			continue;
+		ext_name = elf_sym_str(obj, sym->st_name);
+		if (!ext_name || !ext_name[0])
+			continue;
+
+		ext = obj->externs;
+		ext = libbpf_reallocarray(ext, obj->nr_extern + 1, sizeof(*ext));
+		if (!ext)
+			return -ENOMEM;
+		obj->externs = ext;
+		ext = &ext[obj->nr_extern];
+		memset(ext, 0, sizeof(*ext));
+		obj->nr_extern++;
+
+		ext->btf_id = find_extern_btf_id(obj->btf, ext_name);
+		if (ext->btf_id <= 0) {
+			printf("failed to find BTF for extern '%s': %d\n",
+				ext_name, ext->btf_id);
+			return ext->btf_id;
+		}
+		t = btf__type_by_id(obj->btf, ext->btf_id);
+		ext->name = btf__name_by_offset(obj->btf, t->name_off);
+		ext->sym_idx = i;
+		ext->is_weak = ELF64_ST_BIND(sym->st_info) == STB_WEAK;
+
+		ext_essent_len = bpf_core_essential_name_len(ext->name);
+		ext->essent_name = NULL;
+		if (ext_essent_len != strlen(ext->name)) {
+			ext->essent_name = strndup(ext->name, ext_essent_len);
+			if (!ext->essent_name)
+				return -ENOMEM;
+		}
+
+		ext->sec_btf_id = find_extern_sec_btf_id(obj->btf, ext->btf_id);
+		if (ext->sec_btf_id <= 0) {
+			printf("failed to find BTF for extern '%s' [%d] section: %d\n",
+				ext_name, ext->btf_id, ext->sec_btf_id);
+			return ext->sec_btf_id;
+		}
+		sec = (void *)btf__type_by_id(obj->btf, ext->sec_btf_id);
+		sec_name = btf__name_by_offset(obj->btf, sec->name_off);
+
+		if (strcmp(sec_name, KCONFIG_SEC) == 0) {
+			if (btf_is_func(t)) {
+				printf("extern function %s is unsupported under %s section\n",
+					ext->name, KCONFIG_SEC);
+				return -ENOTSUP;
+			}
+			kcfg_sec = sec;
+			ext->type = EXT_KCFG;
+			ext->kcfg.sz = btf__resolve_size(obj->btf, t->type);
+			if (ext->kcfg.sz <= 0) {
+				printf("failed to resolve size of extern (kcfg) '%s': %d\n",
+					ext_name, ext->kcfg.sz);
+				return ext->kcfg.sz;
+			}
+			ext->kcfg.align = btf__align_of(obj->btf, t->type);
+			if (ext->kcfg.align <= 0) {
+				printf("failed to determine alignment of extern (kcfg) '%s': %d\n",
+					ext_name, ext->kcfg.align);
+				return -EINVAL;
+			}
+			ext->kcfg.type = find_kcfg_type(obj->btf, t->type,
+							&ext->kcfg.is_signed);
+			if (ext->kcfg.type == KCFG_UNKNOWN) {
+				printf("extern (kcfg) '%s': type is unsupported\n", ext_name);
+				return -ENOTSUP;
+			}
+		} else if (strcmp(sec_name, KSYMS_SEC) == 0) {
+			ksym_sec = sec;
+			ext->type = EXT_KSYM;
+			skip_mods_and_typedefs(obj->btf, t->type,
+					       &ext->ksym.type_id);
+		} else {
+			printf("unrecognized extern section '%s'\n", sec_name);
+			return -ENOTSUP;
+		}
+	}
+	printf("collected %d externs total\n", obj->nr_extern);
+
+	if (!obj->nr_extern)
+		return 0;
+
+	/* sort externs by type, for kcfg ones also by (align, size, name) */
+	qsort(obj->externs, obj->nr_extern, sizeof(*ext), cmp_externs);
+
+	/* for .ksyms section, we need to turn all externs into allocated
+	 * variables in BTF to pass kernel verification; we do this by
+	 * pretending that each extern is a 8-byte variable
+	 */
+	if (ksym_sec) {
+		/* find existing 4-byte integer type in BTF to use for fake
+		 * extern variables in DATASEC
+		 */
+		int int_btf_id = find_int_btf_id(obj->btf);
+		/* For extern function, a dummy_var added earlier
+		 * will be used to replace the vs->type and
+		 * its name string will be used to refill
+		 * the missing param's name.
+		 */
+		const struct btf_type *dummy_var;
+
+		dummy_var = btf__type_by_id(obj->btf, dummy_var_btf_id);
+		for (i = 0; i < obj->nr_extern; i++) {
+			ext = &obj->externs[i];
+			if (ext->type != EXT_KSYM)
+				continue;
+			printf("extern (ksym) #%d: symbol %d, name %s\n",
+				 i, ext->sym_idx, ext->name);
+		}
+
+		sec = ksym_sec;
+		n = btf_vlen(sec);
+		for (i = 0, off = 0; i < n; i++, off += sizeof(int)) {
+			struct btf_var_secinfo *vs = btf_var_secinfos(sec) + i;
+			struct btf_type *vt;
+
+			vt = (void *)btf__type_by_id(obj->btf, vs->type);
+			ext_name = btf__name_by_offset(obj->btf, vt->name_off);
+			ext = find_extern_by_name(obj, ext_name);
+			if (!ext) {
+				printf("failed to find extern definition for BTF %s '%s'\n",
+					btf_kind_str(vt), ext_name);
+				return -ESRCH;
+			}
+			if (btf_is_func(vt)) {
+				const struct btf_type *func_proto;
+				struct btf_param *param;
+				int j;
+
+				func_proto = btf__type_by_id(obj->btf,
+							     vt->type);
+				param = btf_params(func_proto);
+				/* Reuse the dummy_var string if the
+				 * func proto does not have param name.
+				 */
+				for (j = 0; j < btf_vlen(func_proto); j++)
+					if (param[j].type && !param[j].name_off)
+						param[j].name_off =
+							dummy_var->name_off;
+				vs->type = dummy_var_btf_id;
+				vt->info &= ~0xffff;
+				vt->info |= BTF_FUNC_GLOBAL;
+			} else {
+				btf_var(vt)->linkage = BTF_VAR_GLOBAL_ALLOCATED;
+				vt->type = int_btf_id;
+			}
+			vs->offset = off;
+			vs->size = sizeof(int);
+		}
+		sec->size = off;
+	}
+
+	if (kcfg_sec) {
+		sec = kcfg_sec;
+		/* for kcfg externs calculate their offsets within a .kconfig map */
+		off = 0;
+		for (i = 0; i < obj->nr_extern; i++) {
+			ext = &obj->externs[i];
+			if (ext->type != EXT_KCFG)
+				continue;
+
+			ext->kcfg.data_off = roundup(off, ext->kcfg.align);
+			off = ext->kcfg.data_off + ext->kcfg.sz;
+			printf("extern (kcfg) #%d: symbol %d, off %u, name %s\n",
+				 i, ext->sym_idx, ext->kcfg.data_off, ext->name);
+		}
+		sec->size = off;
+		n = btf_vlen(sec);
+		for (i = 0; i < n; i++) {
+			struct btf_var_secinfo *vs = btf_var_secinfos(sec) + i;
+
+			t = btf__type_by_id(obj->btf, vs->type);
+			ext_name = btf__name_by_offset(obj->btf, t->name_off);
+			ext = find_extern_by_name(obj, ext_name);
+			if (!ext) {
+				printf("failed to find extern definition for BTF var '%s'\n",
+					ext_name);
+				return -ESRCH;
+			}
+			btf_var(t)->linkage = BTF_VAR_GLOBAL_ALLOCATED;
+			vs->offset = ext->kcfg.data_off;
+		}
+	}
+	return 0;
 }
 
 long libbpf_get_error(const void *ptr)
@@ -1973,6 +2251,30 @@ int parse_btf_map_def(const char *map_name, struct btf *btf,
 	return 0;
 }
 
+static bool bpf_core_is_flavor_sep(const char *s)
+{
+	/* check X___Y name pattern, where X and Y are not underscores */
+	return s[0] != '_' &&				      /* X */
+	       s[1] == '_' && s[2] == '_' && s[3] == '_' &&   /* ___ */
+	       s[4] != '_';				      /* Y */
+}
+
+/* Given 'some_struct_name___with_flavor' return the length of a name prefix
+ * before last triple underscore. Struct name part after last triple
+ * underscore is ignored by BPF CO-RE relocation during relocation matching.
+ */
+size_t bpf_core_essential_name_len(const char *name)
+{
+	size_t n = strlen(name);
+	int i;
+
+	for (i = n - 5; i >= 0; i--) {
+		if (bpf_core_is_flavor_sep(name + i))
+			return i + 1;
+	}
+	return n;
+}
+
 static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf, size_t obj_buf_sz,
 					  const struct bpf_object_open_opts *opts)
 {
@@ -2044,6 +2346,7 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 	err = bpf_object__elf_init(obj);
 	err = err ? : bpf_object__check_endianness(obj);
 	err = err ? : bpf_object__elf_collect(obj);
+	err = err ? : bpf_object__collect_externs(obj);
 out:
 	return NULL;
 }

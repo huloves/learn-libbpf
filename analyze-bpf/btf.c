@@ -1064,6 +1064,61 @@ done:
 	return nelems * size;
 }
 
+int btf__align_of(const struct btf *btf, __u32 id)
+{
+	const struct btf_type *t = btf__type_by_id(btf, id);
+	__u16 kind = btf_kind(t);
+
+	switch (kind) {
+	case BTF_KIND_INT:
+	case BTF_KIND_ENUM:
+	case BTF_KIND_ENUM64:
+	case BTF_KIND_FLOAT:
+		return min(btf_ptr_sz(btf), (size_t)t->size);
+	case BTF_KIND_PTR:
+		return btf_ptr_sz(btf);
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_VOLATILE:
+	case BTF_KIND_CONST:
+	case BTF_KIND_RESTRICT:
+	case BTF_KIND_TYPE_TAG:
+		return btf__align_of(btf, t->type);
+	case BTF_KIND_ARRAY:
+		return btf__align_of(btf, btf_array(t)->type);
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION: {
+		const struct btf_member *m = btf_members(t);
+		__u16 vlen = btf_vlen(t);
+		int i, max_align = 1, align;
+
+		for (i = 0; i < vlen; i++, m++) {
+			align = btf__align_of(btf, m->type);
+			if (align <= 0)
+				return libbpf_err(align);
+			max_align = max(max_align, align);
+
+			/* if field offset isn't aligned according to field
+			 * type's alignment, then struct must be packed
+			 */
+			if (btf_member_bitfield_size(t, i) == 0 &&
+			    (m->offset % (8 * align)) != 0)
+				return 1;
+		}
+
+		/* if struct/union size isn't a multiple of its alignment,
+		 * then struct must be packed
+		 */
+		if ((t->size % max_align) != 0)
+			return 1;
+
+		return max_align;
+	}
+	default:
+		printf("unsupported BTF_KIND:%u\n", btf_kind(t));
+		return errno = EINVAL, 0;
+	}
+}
+
 static void btf_invalidate_raw_data(struct btf *btf)
 {
 	if (btf->raw_data) {
@@ -1292,6 +1347,54 @@ static int validate_type_id(int id)
 static struct btf_type *btf_last_type(struct btf *btf)
 {
 	return btf_type_by_id(btf, btf__type_cnt(btf) - 1);
+}
+
+/*
+ * Append new BTF_KIND_VAR type with:
+ *   - *name* - non-empty/non-NULL name;
+ *   - *linkage* - variable linkage, one of BTF_VAR_STATIC,
+ *     BTF_VAR_GLOBAL_ALLOCATED, or BTF_VAR_GLOBAL_EXTERN;
+ *   - *type_id* - type ID of the type describing the type of the variable.
+ * Returns:
+ *   - >0, type ID of newly added BTF type;
+ *   - <0, on error.
+ */
+int btf__add_var(struct btf *btf, const char *name, int linkage, int type_id)
+{
+	struct btf_type *t;
+	struct btf_var *v;
+	int sz, name_off;
+
+	/* non-empty name */
+	if (!name || !name[0])
+		return libbpf_err(-EINVAL);
+	if (linkage != BTF_VAR_STATIC && linkage != BTF_VAR_GLOBAL_ALLOCATED &&
+	    linkage != BTF_VAR_GLOBAL_EXTERN)
+		return libbpf_err(-EINVAL);
+	if (validate_type_id(type_id))
+		return libbpf_err(-EINVAL);
+
+	/* deconstruct BTF, if necessary, and invalidate raw_data */
+	if (btf_ensure_modifiable(btf))
+		return libbpf_err(-ENOMEM);
+
+	sz = sizeof(struct btf_type) + sizeof(struct btf_var);
+	t = btf_add_type_mem(btf, sz);
+	if (!t)
+		return libbpf_err(-ENOMEM);
+
+	name_off = btf__add_str(btf, name);
+	if (name_off < 0)
+		return name_off;
+
+	t->name_off = name_off;
+	t->info = btf_type_info(BTF_KIND_VAR, 0, 0);
+	t->type = type_id;
+
+	v = btf_var(t);
+	v->linkage = linkage;
+
+	return btf_commit_type(btf, sz);
 }
 
 /*

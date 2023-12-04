@@ -55,6 +55,7 @@ __u32 btf__type_cnt(const struct btf *btf);
 const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
 int btf__set_pointer_size(struct btf *btf, size_t ptr_sz);
 __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+int btf__align_of(const struct btf *btf, __u32 id);
 const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
 const void *btf__raw_data(const struct btf *btf, __u32 *size);
 const char *btf__str_by_offset(const struct btf *btf, __u32 offset);
@@ -76,6 +77,7 @@ int btf__add_fwd(struct btf *btf, const char *name, enum btf_fwd_kind fwd_kind);
 int btf__add_typedef(struct btf *btf, const char *name, int ref_type_id);
 
 /* var & datasec construction APIs */
+int btf__add_var(struct btf *btf, const char *name, int linkage, int type_id);
 int btf__add_datasec(struct btf *btf, const char *name, __u32 byte_sz);
 int btf__add_datasec_var_info(struct btf *btf, int var_type_id,
 					 __u32 offset, __u32 byte_sz);
