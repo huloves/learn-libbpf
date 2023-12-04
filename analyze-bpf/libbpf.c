@@ -1482,6 +1482,167 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 	return bpf_object__init_btf(obj, btf_data, btf_ext_data);
 }
 
+static bool sym_is_extern(const Elf64_Sym *sym)
+{
+	int bind = ELF64_ST_BIND(sym->st_info);
+	/* externs are symbols w/ type=NOTYPE, bind=GLOBAL|WEAK, section=UND */
+	return sym->st_shndx == SHN_UNDEF &&
+	       (bind == STB_GLOBAL || bind == STB_WEAK) &&
+	       ELF64_ST_TYPE(sym->st_info) == STT_NOTYPE;
+}
+
+static bool sym_is_subprog(const Elf64_Sym *sym, int text_shndx)
+{
+	int bind = ELF64_ST_BIND(sym->st_info);
+	int type = ELF64_ST_TYPE(sym->st_info);
+
+	/* in .text section */
+	if (sym->st_shndx != text_shndx)
+		return false;
+
+	/* local function */
+	if (bind == STB_LOCAL && type == STT_SECTION)
+		return true;
+
+	/* global function */
+	return bind == STB_GLOBAL && type == STT_FUNC;
+}
+
+static int find_extern_btf_id(const struct btf *btf, const char *ext_name)
+{
+	const struct btf_type *t;
+	const char *tname;
+	int i, n;
+
+	if (!btf)
+		return -ESRCH;
+
+	n = btf__type_cnt(btf);
+	for (i = 1; i < n; i++) {
+		t = btf__type_by_id(btf, i);
+
+		if (!btf_is_var(t) && !btf_is_func(t))
+			continue;
+
+		tname = btf__name_by_offset(btf, t->name_off);
+		if (strcmp(tname, ext_name))
+			continue;
+
+		if (btf_is_var(t) &&
+		    btf_var(t)->linkage != BTF_VAR_GLOBAL_EXTERN)
+			return -EINVAL;
+
+		if (btf_is_func(t) && btf_func_linkage(t) != BTF_FUNC_EXTERN)
+			return -EINVAL;
+
+		return i;
+	}
+
+	return -ENOENT;
+}
+
+static int find_extern_sec_btf_id(struct btf *btf, int ext_btf_id)
+{
+	const struct btf_var_secinfo *vs;
+	const struct btf_type *t;
+	int i, j, n;
+
+	if (!btf)
+		return -ESRCH;
+
+	n = btf__type_cnt(btf);
+	for (i = 1; i < n; i++) {
+		t = btf__type_by_id(btf, i);
+
+		if (!btf_is_datasec(t))
+			continue;
+
+		vs = btf_var_secinfos(t);
+		for (j = 0; j < btf_vlen(t); j++, vs++) {
+			if (vs->type == ext_btf_id)
+				return i;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static int cmp_externs(const void *_a, const void *_b)
+{
+	const struct extern_desc *a = _a;
+	const struct extern_desc *b = _b;
+
+	if (a->type != b->type)
+		return a->type < b->type ? -1 : 1;
+
+	if (a->type == EXT_KCFG) {
+		/* descending order by alignment requirements */
+		if (a->kcfg.align != b->kcfg.align)
+			return a->kcfg.align > b->kcfg.align ? -1 : 1;
+		/* ascending order by size, within same alignment class */
+		if (a->kcfg.sz != b->kcfg.sz)
+			return a->kcfg.sz < b->kcfg.sz ? -1 : 1;
+	}
+
+	/* resolve ties by name */
+	return strcmp(a->name, b->name);
+}
+
+static int find_int_btf_id(const struct btf *btf)
+{
+	const struct btf_type *t;
+	int i, n;
+
+	n = btf__type_cnt(btf);
+	for (i = 1; i < n; i++) {
+		t = btf__type_by_id(btf, i);
+
+		if (btf_is_int(t) && btf_int_bits(t) == 32)
+			return i;
+	}
+
+	return 0;
+}
+
+static int add_dummy_ksym_var(struct btf *btf)
+{
+	int i, int_btf_id, sec_btf_id, dummy_var_btf_id;
+	const struct btf_var_secinfo *vs;
+	const struct btf_type *sec;
+
+	if (!btf)
+		return 0;
+	
+	sec_btf_id = btf__find_by_name_kind(btf, KSYMS_SEC,
+					    BTF_KIND_DATASEC);
+	if (sec_btf_id < 0)
+		return 0;
+}
+
+static int bpf_object__collect_externs(struct bpf_object *obj)
+{
+	struct btf_type *sec, *kcfg_sec = NULL, *ksym_sec = NULL;
+	const struct btf_type *t;
+	struct extern_desc *ext;
+	int i, n, off, dummy_var_btf_id;
+	const char *ext_name, *sec_name;
+	size_t ext_essent_len;
+	Elf_Scn *scn;
+	Elf64_Shdr *sh;
+
+	if (!obj->efile.symbols)
+		return 0;
+	
+	scn = elf_sec_by_idx(obj, obj->efile.symbols_shndx);
+	sh = elf_sec_hdr(obj, scn);
+	if (!sh || sh->sh_entsize != sizeof(Elf64_Sym))
+		return -LIBBPF_ERRNO__FORMAT;
+	
+	// dummy_var_btf_id = add_dummy_ksym_var(obj->btf);
+	if (dummy_var_btf_id < 0)
+		return dummy_var_btf_id;
+}
+
 long libbpf_get_error(const void *ptr)
 {
 	if (!IS_ERR_OR_NULL(ptr))
