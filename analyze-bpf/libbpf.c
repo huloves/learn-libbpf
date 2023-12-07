@@ -3,10 +3,13 @@
 #endif
 #include <stdio.h>
 #include <string.h>
-#include <linux/err.h>
+#include <unistd.h>
 #include <errno.h>
 #include <gelf.h>
+#include <ctype.h>
+#include <linux/err.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 
 #include "str_error.h"
 #include "libbpf.h"
@@ -794,6 +797,11 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 	return 0;
 }
 
+static bool bpf_map__is_struct_ops(const struct bpf_map *map)
+{
+	return map->def.type == BPF_MAP_TYPE_STRUCT_OPS;
+}
+
 static struct bpf_object *bpf_object__new(const char *path,
 					  const void *obj_buf,
 					  size_t obj_buf_sz,
@@ -996,6 +1004,254 @@ static bool bpf_map_type__is_map_in_map(enum bpf_map_type type)
 	return false;
 }
 
+static int find_elf_sec_sz(const struct bpf_object *obj, const char *name, __u32 *size)
+{
+	Elf_Data *data;
+	Elf_Scn *scn;
+
+	if (!name)
+		return -EINVAL;
+
+	scn = elf_sec_by_name(obj, name);
+	data = elf_sec_data(obj, scn);
+	if (data) {
+		*size = data->d_size;
+		return 0; /* found it */
+	}
+
+	return -ENOENT;
+}
+
+static Elf64_Sym *find_elf_var_sym(const struct bpf_object *obj, const char *name)
+{
+	Elf_Data *symbols = obj->efile.symbols;
+	const char *sname;
+	size_t si;
+
+	for (si = 0; si < symbols->d_size / sizeof(Elf64_Sym); si++) {
+		Elf64_Sym *sym = elf_sym_by_idx(obj, si);
+
+		if (ELF64_ST_TYPE(sym->st_info) != STT_OBJECT)
+			continue;
+
+		if (ELF64_ST_BIND(sym->st_info) != STB_GLOBAL &&
+		    ELF64_ST_BIND(sym->st_info) != STB_WEAK)
+			continue;
+
+		sname = elf_sym_str(obj, sym->st_name);
+		if (!sname) {
+			printf("failed to get sym name string for var %s\n", name);
+			return ERR_PTR(-EIO);
+		}
+		if (strcmp(name, sname) == 0)
+			return sym;
+	}
+
+	return ERR_PTR(-ENOENT);
+}
+
+static struct bpf_map *bpf_object__add_map(struct bpf_object *obj)
+{
+	struct bpf_map *map;
+	int err;
+
+	err = libbpf_ensure_mem((void **)&obj->maps, &obj->maps_cap,
+				sizeof(*obj->maps), obj->nr_maps + 1);
+	if (err)
+		return ERR_PTR(err);
+
+	map = &obj->maps[obj->nr_maps++];
+	map->obj = obj;
+	map->fd = -1;
+	map->inner_map_fd = -1;
+	map->autocreate = true;
+
+	return map;
+}
+
+static size_t bpf_map_mmap_sz(unsigned int value_sz, unsigned int max_entries)
+{
+	const long page_sz = sysconf(_SC_PAGE_SIZE);
+	size_t map_sz;
+
+	map_sz = (size_t)roundup(value_sz, 8) * max_entries;
+	map_sz = roundup(map_sz, page_sz);
+	return map_sz;
+}
+
+static int bpf_map_mmap_resize(struct bpf_map *map, size_t old_sz, size_t new_sz)
+{
+	void *mmaped;
+
+	if (!map->mmaped)
+		return -EINVAL;
+
+	if (old_sz == new_sz)
+		return 0;
+
+	mmaped = mmap(NULL, new_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (mmaped == MAP_FAILED)
+		return -errno;
+
+	memcpy(mmaped, map->mmaped, min(old_sz, new_sz));
+	munmap(map->mmaped, old_sz);
+	map->mmaped = mmaped;
+	return 0;
+}
+
+static char *internal_map_name(struct bpf_object *obj, const char *real_name)
+{
+	char map_name[BPF_OBJ_NAME_LEN], *p;
+	int pfx_len, sfx_len = max((size_t)7, strlen(real_name));
+
+	/* This is one of the more confusing parts of libbpf for various
+	 * reasons, some of which are historical. The original idea for naming
+	 * internal names was to include as much of BPF object name prefix as
+	 * possible, so that it can be distinguished from similar internal
+	 * maps of a different BPF object.
+	 * As an example, let's say we have bpf_object named 'my_object_name'
+	 * and internal map corresponding to '.rodata' ELF section. The final
+	 * map name advertised to user and to the kernel will be
+	 * 'my_objec.rodata', taking first 8 characters of object name and
+	 * entire 7 characters of '.rodata'.
+	 * Somewhat confusingly, if internal map ELF section name is shorter
+	 * than 7 characters, e.g., '.bss', we still reserve 7 characters
+	 * for the suffix, even though we only have 4 actual characters, and
+	 * resulting map will be called 'my_objec.bss', not even using all 15
+	 * characters allowed by the kernel. Oh well, at least the truncated
+	 * object name is somewhat consistent in this case. But if the map
+	 * name is '.kconfig', we'll still have entirety of '.kconfig' added
+	 * (8 chars) and thus will be left with only first 7 characters of the
+	 * object name ('my_obje'). Happy guessing, user, that the final map
+	 * name will be "my_obje.kconfig".
+	 * Now, with libbpf starting to support arbitrarily named .rodata.*
+	 * and .data.* data sections, it's possible that ELF section name is
+	 * longer than allowed 15 chars, so we now need to be careful to take
+	 * only up to 15 first characters of ELF name, taking no BPF object
+	 * name characters at all. So '.rodata.abracadabra' will result in
+	 * '.rodata.abracad' kernel and user-visible name.
+	 * We need to keep this convoluted logic intact for .data, .bss and
+	 * .rodata maps, but for new custom .data.custom and .rodata.custom
+	 * maps we use their ELF names as is, not prepending bpf_object name
+	 * in front. We still need to truncate them to 15 characters for the
+	 * kernel. Full name can be recovered for such maps by using DATASEC
+	 * BTF type associated with such map's value type, though.
+	 */
+	if (sfx_len >= BPF_OBJ_NAME_LEN)
+		sfx_len = BPF_OBJ_NAME_LEN - 1;
+
+	/* if there are two or more dots in map name, it's a custom dot map */
+	if (strchr(real_name + 1, '.') != NULL)
+		pfx_len = 0;
+	else
+		pfx_len = min((size_t)BPF_OBJ_NAME_LEN - sfx_len - 1, strlen(obj->name));
+
+	snprintf(map_name, sizeof(map_name), "%.*s%.*s", pfx_len, obj->name,
+		 sfx_len, real_name);
+
+	/* sanitise map name to characters allowed by kernel */
+	for (p = map_name; *p && p < map_name + sizeof(map_name); p++)
+		if (!isalnum(*p) && *p != '_' && *p != '.')
+			*p = '_';
+
+	return strdup(map_name);
+}
+
+static int
+map_fill_btf_type_info(struct bpf_object *obj, struct bpf_map *map);
+
+/* Internal BPF map is mmap()'able only if at least one of corresponding
+ * DATASEC's VARs are to be exposed through BPF skeleton. I.e., it's a GLOBAL
+ * variable and it's not marked as __hidden (which turns it into, effectively,
+ * a STATIC variable).
+ */
+static bool map_is_mmapable(struct bpf_object *obj, struct bpf_map *map)
+{
+	const struct btf_type *t, *vt;
+	struct btf_var_secinfo *vsi;
+	int i, n;
+
+	if (!map->btf_value_type_id)
+		return false;
+
+	t = btf__type_by_id(obj->btf, map->btf_value_type_id);
+	if (!btf_is_datasec(t))
+		return false;
+
+	vsi = btf_var_secinfos(t);
+	for (i = 0, n = btf_vlen(t); i < n; i++, vsi++) {
+		vt = btf__type_by_id(obj->btf, vsi->type);
+		if (!btf_is_var(vt))
+			continue;
+
+		if (btf_var(vt)->linkage != BTF_VAR_STATIC)
+			return true;
+	}
+
+	return false;
+}
+
+static int
+bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
+			      const char *real_name, int sec_idx, void *data, size_t data_sz)
+{
+	struct bpf_map_def *def;
+	struct bpf_map *map;
+	size_t mmap_sz;
+	int err;
+
+	map = bpf_object__add_map(obj);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	map->libbpf_type = type;
+	map->sec_idx = sec_idx;
+	map->sec_offset = 0;
+	map->real_name = strdup(real_name);
+	map->name = internal_map_name(obj, real_name);
+	if (!map->real_name || !map->name) {
+		zfree(&map->real_name);
+		zfree(&map->name);
+		return -ENOMEM;
+	}
+
+	def = &map->def;
+	def->type = BPF_MAP_TYPE_ARRAY;
+	def->key_size = sizeof(int);
+	def->value_size = data_sz;
+	def->max_entries = 1;
+	def->map_flags = type == LIBBPF_MAP_RODATA || type == LIBBPF_MAP_KCONFIG
+			 ? BPF_F_RDONLY_PROG : 0;
+
+	/* failures are fine because of maps like .rodata.str1.1 */
+	(void) map_fill_btf_type_info(obj, map);
+
+	if (map_is_mmapable(obj, map))
+		def->map_flags |= BPF_F_MMAPABLE;
+
+	printf("map '%s' (global data): at sec_idx %d, offset %zu, flags %x.\n",
+		 map->name, map->sec_idx, map->sec_offset, def->map_flags);
+
+	mmap_sz = bpf_map_mmap_sz(map->def.value_size, map->def.max_entries);
+	map->mmaped = mmap(NULL, mmap_sz, PROT_READ | PROT_WRITE,
+			   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (map->mmaped == MAP_FAILED) {
+		err = -errno;
+		map->mmaped = NULL;
+		printf("failed to alloc map '%s' content buffer: %d\n",
+			map->name, err);
+		zfree(&map->real_name);
+		zfree(&map->name);
+		return err;
+	}
+
+	if (data)
+		memcpy(map->mmaped, data, data_sz);
+
+	printf("map %td is \"%s\"\n", map - obj->maps, map->name);
+	return 0;
+}
+
 static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
 					       const void *name)
 {
@@ -1006,17 +1262,6 @@ static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
 			return &obj->externs[i];
 	}
 	return NULL;
-}
-
-static bool section_have_execinstr(struct bpf_object *obj, int idx)
-{
-	Elf64_Shdr *sh;
-
-	sh = elf_sec_hdr(obj, elf_sec_by_idx(obj, idx));
-	if (!sh)
-		return false;
-
-	return sh->sh_flags & SHF_EXECINSTR;
 }
 
 static bool libbpf_needs_btf(const struct bpf_object *obj)
@@ -1115,6 +1360,133 @@ out:
 		printf("BTF is required, but is missing or corrupted.\n");
 		return err;
 	}
+	return 0;
+}
+
+static int compare_vsi_off(const void *_a, const void *_b)
+{
+	const struct btf_var_secinfo *a = _a;
+	const struct btf_var_secinfo *b = _b;
+
+	return a->offset - b->offset;
+}
+
+static int btf_fixup_datasec(struct bpf_object *obj, struct btf *btf,
+			     struct btf_type *t)
+{
+	__u32 size = 0, i, vars = btf_vlen(t);
+	const char *sec_name = btf__name_by_offset(btf, t->name_off);
+	struct btf_var_secinfo *vsi;
+	bool fixup_offsets = false;
+	int err;
+
+	if (!sec_name) {
+		printf("No name found in string section for DATASEC kind.\n");
+		return -ENOENT;
+	}
+
+	/* Extern-backing datasecs (.ksyms, .kconfig) have their size and
+	 * variable offsets set at the previous step. Further, not every
+	 * extern BTF VAR has corresponding ELF symbol preserved, so we skip
+	 * all fixups altogether for such sections and go straight to sorting
+	 * VARs within their DATASEC.
+	 */
+	if (strcmp(sec_name, KCONFIG_SEC) == 0 || strcmp(sec_name, KSYMS_SEC) == 0)
+		goto sort_vars;
+
+	/* Clang leaves DATASEC size and VAR offsets as zeroes, so we need to
+	 * fix this up. But BPF static linker already fixes this up and fills
+	 * all the sizes and offsets during static linking. So this step has
+	 * to be optional. But the STV_HIDDEN handling is non-optional for any
+	 * non-extern DATASEC, so the variable fixup loop below handles both
+	 * functions at the same time, paying the cost of BTF VAR <-> ELF
+	 * symbol matching just once.
+	 */
+	if (t->size == 0) {
+		err = find_elf_sec_sz(obj, sec_name, &size);
+		if (err || !size) {
+			printf("sec '%s': failed to determine size from ELF: size %u, err %d\n",
+				 sec_name, size, err);
+			return -ENOENT;
+		}
+
+		t->size = size;
+		fixup_offsets = true;
+	}
+
+	for (i = 0, vsi = btf_var_secinfos(t); i < vars; i++, vsi++) {
+		const struct btf_type *t_var;
+		struct btf_var *var;
+		const char *var_name;
+		Elf64_Sym *sym;
+
+		t_var = btf__type_by_id(btf, vsi->type);
+		if (!t_var || !btf_is_var(t_var)) {
+			printf("sec '%s': unexpected non-VAR type found\n", sec_name);
+			return -EINVAL;
+		}
+
+		var = btf_var(t_var);
+		if (var->linkage == BTF_VAR_STATIC || var->linkage == BTF_VAR_GLOBAL_EXTERN)
+			continue;
+
+		var_name = btf__name_by_offset(btf, t_var->name_off);
+		if (!var_name) {
+			printf("sec '%s': failed to find name of DATASEC's member #%d\n",
+				 sec_name, i);
+			return -ENOENT;
+		}
+
+		sym = find_elf_var_sym(obj, var_name);
+		if (IS_ERR(sym)) {
+			printf("sec '%s': failed to find ELF symbol for VAR '%s'\n",
+				 sec_name, var_name);
+			return -ENOENT;
+		}
+
+		if (fixup_offsets)
+			vsi->offset = sym->st_value;
+
+		/* if variable is a global/weak symbol, but has restricted
+		 * (STV_HIDDEN or STV_INTERNAL) visibility, mark its BTF VAR
+		 * as static. This follows similar logic for functions (BPF
+		 * subprogs) and influences libbpf's further decisions about
+		 * whether to make global data BPF array maps as
+		 * BPF_F_MMAPABLE.
+		 */
+		if (ELF64_ST_VISIBILITY(sym->st_other) == STV_HIDDEN
+		    || ELF64_ST_VISIBILITY(sym->st_other) == STV_INTERNAL)
+			var->linkage = BTF_VAR_STATIC;
+	}
+
+sort_vars:
+	qsort(btf_var_secinfos(t), vars, sizeof(*vsi), compare_vsi_off);
+	return 0;
+}
+
+static int bpf_object_fixup_btf(struct bpf_object *obj)
+{
+	int i, n, err = 0;
+
+	if (!obj->btf)
+		return 0;
+
+	n = btf__type_cnt(obj->btf);
+	for (i = 1; i < n; i++) {
+		struct btf_type *t = btf_type_by_id(obj->btf, i);
+
+		/* Loader needs to fix up some of the things compiler
+		 * couldn't get its hands on while emitting BTF. This
+		 * is section size and global variable offset. We use
+		 * the info from the ELF itself for this purpose.
+		 */
+		if (btf_is_datasec(t)) {
+			err = btf_fixup_datasec(obj, obj->btf, t);
+			if (err)
+				return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -1293,6 +1665,17 @@ static bool ignore_elf_section(Elf64_Shdr *hdr, const char *name)
 	}
 
 	return false;
+}
+
+static bool section_have_execinstr(struct bpf_object *obj, int idx)
+{
+	Elf64_Shdr *sh;
+
+	sh = elf_sec_hdr(obj, elf_sec_by_idx(obj, idx));
+	if (!sh)
+		return false;
+
+	return sh->sh_flags & SHF_EXECINSTR;
 }
 
 static int cmp_progs(const void *_a, const void *_b)
@@ -1921,6 +2304,41 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 	return 0;
 }
 
+static bool prog_is_subprog(const struct bpf_object *obj, const struct bpf_program *prog)
+{
+	return prog->sec_idx == obj->efile.text_shndx && obj->nr_programs > 1;
+}
+
+static int map_fill_btf_type_info(struct bpf_object *obj, struct bpf_map *map)
+{
+	int id;
+
+	if (!obj->btf)
+		return -ENOENT;
+
+	/* if it's BTF-defined map, we don't need to search for type IDs.
+	 * For struct_ops map, it does not need btf_key_type_id and
+	 * btf_value_type_id.
+	 */
+	if (map->sec_idx == obj->efile.btf_maps_shndx || bpf_map__is_struct_ops(map))
+		return 0;
+
+	/*
+	 * LLVM annotates global data differently in BTF, that is,
+	 * only as '.data', '.bss' or '.rodata'.
+	 */
+	if (!bpf_map__is_internal(map))
+		return -ENOENT;
+
+	id = btf__find_by_name(obj->btf, map->real_name);
+	if (id < 0)
+		return id;
+
+	map->btf_key_type_id = 0;
+	map->btf_value_type_id = id;
+	return 0;
+}
+
 long libbpf_get_error(const void *ptr)
 {
 	if (!IS_ERR_OR_NULL(ptr))
@@ -2021,6 +2439,34 @@ static bool get_map_field_int(const char *map_name, const struct btf *btf,
 	arr_info = btf_array(arr_t);
 	*res = arr_info->nelems;
 	return true;
+}
+
+static int pathname_concat(char *buf, size_t buf_sz, const char *path, const char *name)
+{
+	int len;
+
+	len = snprintf(buf, buf_sz, "%s/%s", path, name);
+	if (len < 0)
+		return -EINVAL;
+	if (len >= buf_sz)
+		return -ENAMETOOLONG;
+
+	return 0;
+}
+
+static int build_map_pin_path(struct bpf_map *map, const char *path)
+{
+	char buf[PATH_MAX];
+	int err;
+
+	if (!path)
+		path = "/sys/fs/bpf";
+
+	err = pathname_concat(buf, sizeof(buf), path, bpf_map__name(map));
+	if (err)
+		return err;
+
+	return bpf_map__set_pin_path(map, buf);
 }
 
 /* should match definition in bpf_helpers.h */
@@ -2251,6 +2697,271 @@ int parse_btf_map_def(const char *map_name, struct btf *btf,
 	return 0;
 }
 
+static size_t adjust_ringbuf_sz(size_t sz)
+{
+	__u32 page_sz = sysconf(_SC_PAGE_SIZE);
+	__u32 mul;
+
+	/* if user forgot to set any size, make sure they see error */
+	if (sz == 0)
+		return 0;
+	/* Kernel expects BPF_MAP_TYPE_RINGBUF's max_entries to be
+	 * a power-of-2 multiple of kernel's page size. If user diligently
+	 * satisified these conditions, pass the size through.
+	 */
+	if ((sz % page_sz) == 0 && is_pow_of_2(sz / page_sz))
+		return sz;
+
+	/* Otherwise find closest (page_sz * power_of_2) product bigger than
+	 * user-set size to satisfy both user size request and kernel
+	 * requirements and substitute correct max_entries for map creation.
+	 */
+	for (mul = 1; mul <= UINT_MAX / page_sz; mul <<= 1) {
+		if (mul * page_sz > sz)
+			return mul * page_sz;
+	}
+
+	/* if it's impossible to satisfy the conditions (i.e., user size is
+	 * very close to UINT_MAX but is not a power-of-2 multiple of
+	 * page_size) then just return original size and let kernel reject it
+	 */
+	return sz;
+}
+
+static bool map_is_ringbuf(const struct bpf_map *map)
+{
+	return map->def.type == BPF_MAP_TYPE_RINGBUF ||
+	       map->def.type == BPF_MAP_TYPE_USER_RINGBUF;
+}
+
+static void fill_map_from_def(struct bpf_map *map, const struct btf_map_def *def)
+{
+	map->def.type = def->map_type;
+	map->def.key_size = def->key_size;
+	map->def.value_size = def->value_size;
+	map->def.max_entries = def->max_entries;
+	map->def.map_flags = def->map_flags;
+	map->map_extra = def->map_extra;
+
+	map->numa_node = def->numa_node;
+	map->btf_key_type_id = def->key_type_id;
+	map->btf_value_type_id = def->value_type_id;
+
+	/* auto-adjust BPF ringbuf map max_entries to be a multiple of page size */
+	if (map_is_ringbuf(map))
+		map->def.max_entries = adjust_ringbuf_sz(map->def.max_entries);
+
+	if (def->parts & MAP_DEF_MAP_TYPE)
+		printf("map '%s': found type = %u.\n", map->name, def->map_type);
+
+	if (def->parts & MAP_DEF_KEY_TYPE)
+		printf("map '%s': found key [%u], sz = %u.\n",
+			 map->name, def->key_type_id, def->key_size);
+	else if (def->parts & MAP_DEF_KEY_SIZE)
+		printf("map '%s': found key_size = %u.\n", map->name, def->key_size);
+
+	if (def->parts & MAP_DEF_VALUE_TYPE)
+		printf("map '%s': found value [%u], sz = %u.\n",
+			 map->name, def->value_type_id, def->value_size);
+	else if (def->parts & MAP_DEF_VALUE_SIZE)
+		printf("map '%s': found value_size = %u.\n", map->name, def->value_size);
+
+	if (def->parts & MAP_DEF_MAX_ENTRIES)
+		printf("map '%s': found max_entries = %u.\n", map->name, def->max_entries);
+	if (def->parts & MAP_DEF_MAP_FLAGS)
+		printf("map '%s': found map_flags = 0x%x.\n", map->name, def->map_flags);
+	if (def->parts & MAP_DEF_MAP_EXTRA)
+		printf("map '%s': found map_extra = 0x%llx.\n", map->name,
+			 (unsigned long long)def->map_extra);
+	if (def->parts & MAP_DEF_PINNING)
+		printf("map '%s': found pinning = %u.\n", map->name, def->pinning);
+	if (def->parts & MAP_DEF_NUMA_NODE)
+		printf("map '%s': found numa_node = %u.\n", map->name, def->numa_node);
+
+	if (def->parts & MAP_DEF_INNER_MAP)
+		printf("map '%s': found inner map definition.\n", map->name);
+}
+
+static const char *btf_var_linkage_str(__u32 linkage)
+{
+	switch (linkage) {
+	case BTF_VAR_STATIC: return "static";
+	case BTF_VAR_GLOBAL_ALLOCATED: return "global";
+	case BTF_VAR_GLOBAL_EXTERN: return "extern";
+	default: return "unknown";
+	}
+}
+
+static int bpf_object__init_user_btf_map(struct bpf_object *obj,
+					 const struct btf_type *sec,
+					 int var_idx, int sec_idx,
+					 const Elf_Data *data, bool strict,
+					 const char *pin_root_path)
+{
+	struct btf_map_def map_def = {}, inner_def = {};
+	const struct btf_type *var, *def;
+	const struct btf_var_secinfo *vi;
+	const struct btf_var *var_extra;
+	const char *map_name;
+	struct bpf_map *map;
+	int err;
+
+	vi = btf_var_secinfos(sec) + var_idx;
+	var = btf__type_by_id(obj->btf, vi->type);
+	var_extra = btf_var(var);
+	map_name = btf__name_by_offset(obj->btf, var->name_off);
+
+	if (map_name == NULL || map_name[0] == '\0') {
+		printf("map #%d: empty name.\n", var_idx);
+		return -EINVAL;
+	}
+	if ((__u64)vi->offset + vi->size > data->d_size) {
+		printf("map '%s' BTF data is corrupted.\n", map_name);
+		return -EINVAL;
+	}
+	if (!btf_is_var(var)) {
+		printf("map '%s': unexpected var kind %s.\n",
+			map_name, btf_kind_str(var));
+		return -EINVAL;
+	}
+	if (var_extra->linkage != BTF_VAR_GLOBAL_ALLOCATED) {
+		printf("map '%s': unsupported map linkage %s.\n",
+			map_name, btf_var_linkage_str(var_extra->linkage));
+		return -EOPNOTSUPP;
+	}
+
+	def = skip_mods_and_typedefs(obj->btf, var->type, NULL);
+	if (!btf_is_struct(def)) {
+		printf("map '%s': unexpected def kind %s.\n",
+			map_name, btf_kind_str(var));
+		return -EINVAL;
+	}
+	if (def->size > vi->size) {
+		printf("map '%s': invalid def size.\n", map_name);
+		return -EINVAL;
+	}
+
+	map = bpf_object__add_map(obj);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+	map->name = strdup(map_name);
+	if (!map->name) {
+		printf("map '%s': failed to alloc map name.\n", map_name);
+		return -ENOMEM;
+	}
+	map->libbpf_type = LIBBPF_MAP_UNSPEC;
+	map->def.type = BPF_MAP_TYPE_UNSPEC;
+	map->sec_idx = sec_idx;
+	map->sec_offset = vi->offset;
+	map->btf_var_idx = var_idx;
+	printf("map '%s': at sec_idx %d, offset %zu.\n",
+		 map_name, map->sec_idx, map->sec_offset);
+
+	err = parse_btf_map_def(map->name, obj->btf, def, strict, &map_def, &inner_def);
+	if (err)
+		return err;
+
+	fill_map_from_def(map, &map_def);
+
+	if (map_def.pinning == LIBBPF_PIN_BY_NAME) {
+		err = build_map_pin_path(map, pin_root_path);
+		if (err) {
+			printf("map '%s': couldn't build pin path.\n", map->name);
+			return err;
+		}
+	}
+
+	if (map_def.parts & MAP_DEF_INNER_MAP) {
+		map->inner_map = calloc(1, sizeof(*map->inner_map));
+		if (!map->inner_map)
+			return -ENOMEM;
+		map->inner_map->fd = -1;
+		map->inner_map->sec_idx = sec_idx;
+		map->inner_map->name = malloc(strlen(map_name) + sizeof(".inner") + 1);
+		if (!map->inner_map->name)
+			return -ENOMEM;
+		sprintf(map->inner_map->name, "%s.inner", map_name);
+
+		fill_map_from_def(map->inner_map, &inner_def);
+	}
+
+	err = map_fill_btf_type_info(obj, map);
+	if (err)
+		return err;
+
+	return 0;
+}
+
+static int bpf_object__init_user_btf_maps(struct bpf_object *obj, bool strict,
+					  const char *pin_root_path)
+{
+	const struct btf_type *sec = NULL;
+	int nr_types, i, vlen, err;
+	const struct btf_type *t;
+	const char *name;
+	Elf_Data *data;
+	Elf_Scn *scn;
+
+	if (obj->efile.btf_maps_shndx < 0)
+		return 0;
+
+	scn = elf_sec_by_idx(obj, obj->efile.btf_maps_shndx);
+	data = elf_sec_data(obj, scn);
+	if (!scn || !data) {
+		printf("elf: failed to get %s map definitions for %s\n",
+			MAPS_ELF_SEC, obj->path);
+		return -EINVAL;
+	}
+
+	nr_types = btf__type_cnt(obj->btf);
+	for (i = 1; i < nr_types; i++) {
+		t = btf__type_by_id(obj->btf, i);
+		if (!btf_is_datasec(t))
+			continue;
+		name = btf__name_by_offset(obj->btf, t->name_off);
+		if (strcmp(name, MAPS_ELF_SEC) == 0) {
+			sec = t;
+			obj->efile.btf_maps_sec_btf_id = i;
+			break;
+		}
+	}
+
+	if (!sec) {
+		printf("DATASEC '%s' not found.\n", MAPS_ELF_SEC);
+		return -ENOENT;
+	}
+
+	vlen = btf_vlen(sec);
+	for (i = 0; i < vlen; i++) {
+		err = bpf_object__init_user_btf_map(obj, sec, i,
+						    obj->efile.btf_maps_shndx,
+						    data, strict,
+						    pin_root_path);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int bpf_object__init_maps(struct bpf_object *obj,
+				 const struct bpf_object_open_opts *opts)
+{
+	const char *pin_root_path;
+	bool strict;
+	int err = 0;
+
+	strict = !OPTS_GET(opts, relaxed_maps, false);
+	pin_root_path = OPTS_GET(opts, pin_root_path, NULL);
+
+	err = bpf_object__init_user_btf_maps(obj, strict, pin_root_path);
+	// err = err ?: bpf_object__init_global_data_maps(obj);
+	// err = err ?: bpf_object__init_kconfig_map(obj);
+	// err = err ?: bpf_object_init_struct_ops(obj);
+
+	return err;
+}
+
 static bool bpf_core_is_flavor_sep(const char *s)
 {
 	/* check X___Y name pattern, where X and Y are not underscores */
@@ -2273,6 +2984,41 @@ size_t bpf_core_essential_name_len(const char *name)
 			return i + 1;
 	}
 	return n;
+}
+
+static const struct bpf_sec_def *find_sec_def(const char *sec_name);
+
+static int bpf_object_init_progs(struct bpf_object *obj, const struct bpf_object_open_opts *opts)
+{
+	struct bpf_program *prog;
+	int err;
+
+	bpf_object__for_each_program(prog, obj) {
+		prog->sec_def = find_sec_def(prog->sec_name);
+		if (!prog->sec_def) {
+			/* couldn't guess, but user might manually specify */
+			printf("prog '%s': unrecognized ELF section name '%s'\n",
+				prog->name, prog->sec_name);
+			continue;
+		}
+
+		prog->type = prog->sec_def->prog_type;
+		prog->expected_attach_type = prog->sec_def->expected_attach_type;
+
+		/* sec_def can have custom callback which should be called
+		 * after bpf_program is initialized to adjust its properties
+		 */
+		if (prog->sec_def->prog_setup_fn) {
+			err = prog->sec_def->prog_setup_fn(prog, prog->sec_def->cookie);
+			if (err < 0) {
+				printf("prog '%s': failed to initialize: %d\n",
+					prog->name, err);
+				return err;
+			}
+		}
+	}
+
+	return 0;
 }
 
 static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf, size_t obj_buf_sz,
@@ -2347,6 +3093,9 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 	err = err ? : bpf_object__check_endianness(obj);
 	err = err ? : bpf_object__elf_collect(obj);
 	err = err ? : bpf_object__collect_externs(obj);
+	err = err ? : bpf_object_fixup_btf(obj);
+	err = err ? : bpf_object__init_maps(obj, opts);
+	err = err ? : bpf_object_init_progs(obj, opts);
 out:
 	return NULL;
 }
@@ -2359,4 +3108,256 @@ bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
 		return libbpf_err_ptr(-EINVAL);
 
 	return libbpf_ptr(bpf_object_open(NULL, obj_buf, obj_buf_sz, opts));
+}
+
+int bpf_map__set_pin_path(struct bpf_map *map, const char *path)
+{
+	char *new = NULL;
+
+	if (path) {
+		new = strdup(path);
+		if (!new)
+			return libbpf_err(-errno);
+	}
+
+	free(map->pin_path);
+	map->pin_path = new;
+	return 0;
+}
+
+static struct bpf_program *
+__bpf_program__iter(const struct bpf_program *p, const struct bpf_object *obj,
+		    bool forward)
+{
+	size_t nr_programs = obj->nr_programs;
+	ssize_t idx;
+
+	if (!nr_programs)
+		return NULL;
+
+	if (!p)
+		/* Iter from the beginning */
+		return forward ? &obj->programs[0] :
+			&obj->programs[nr_programs - 1];
+
+	if (p->obj != obj) {
+		printf("error: program handler doesn't match object\n");
+		return errno = EINVAL, NULL;
+	}
+
+	idx = (p - obj->programs) + (forward ? 1 : -1);
+	if (idx >= obj->nr_programs || idx < 0)
+		return NULL;
+	return &obj->programs[idx];
+}
+
+struct bpf_program *
+bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prev)
+{
+	struct bpf_program *prog = prev;
+
+	do {
+		prog = __bpf_program__iter(prog, obj, true);
+	} while (prog && prog_is_subprog(obj, prog));
+
+	return prog;
+}
+
+static bool map_uses_real_name(const struct bpf_map *map)
+{
+	/* Since libbpf started to support custom .data.* and .rodata.* maps,
+	 * their user-visible name differs from kernel-visible name. Users see
+	 * such map's corresponding ELF section name as a map name.
+	 * This check distinguishes .data/.rodata from .data.* and .rodata.*
+	 * maps to know which name has to be returned to the user.
+	 */
+	if (map->libbpf_type == LIBBPF_MAP_DATA && strcmp(map->real_name, DATA_SEC) != 0)
+		return true;
+	if (map->libbpf_type == LIBBPF_MAP_RODATA && strcmp(map->real_name, RODATA_SEC) != 0)
+		return true;
+	return false;
+}
+
+const char *bpf_map__name(const struct bpf_map *map)
+{
+	if (!map)
+		return NULL;
+
+	if (map_uses_real_name(map))
+		return map->real_name;
+
+	return map->name;
+}
+
+bool bpf_map__is_internal(const struct bpf_map *map)
+{
+	return map->libbpf_type != LIBBPF_MAP_UNSPEC;
+}
+
+#define SEC_DEF(sec_pfx, ptype, atype, flags, ...) {			    \
+	.sec = (char *)sec_pfx,						    \
+	.prog_type = BPF_PROG_TYPE_##ptype,				    \
+	.expected_attach_type = atype,					    \
+	.cookie = (long)(flags),					    \
+	.prog_prepare_load_fn = libbpf_prepare_prog_load,		    \
+	__VA_ARGS__							    \
+}
+
+static const struct bpf_sec_def section_defs[] = {
+	// SEC_DEF("socket",		SOCKET_FILTER, 0, SEC_NONE),
+	// SEC_DEF("sk_reuseport/migrate",	SK_REUSEPORT, BPF_SK_REUSEPORT_SELECT_OR_MIGRATE, SEC_ATTACHABLE),
+	// SEC_DEF("sk_reuseport",		SK_REUSEPORT, BPF_SK_REUSEPORT_SELECT, SEC_ATTACHABLE),
+	// SEC_DEF("kprobe+",		KPROBE,	0, SEC_NONE, attach_kprobe),
+	// SEC_DEF("uprobe+",		KPROBE,	0, SEC_NONE, attach_uprobe),
+	// SEC_DEF("uprobe.s+",		KPROBE,	0, SEC_SLEEPABLE, attach_uprobe),
+	// SEC_DEF("kretprobe+",		KPROBE, 0, SEC_NONE, attach_kprobe),
+	// SEC_DEF("uretprobe+",		KPROBE, 0, SEC_NONE, attach_uprobe),
+	// SEC_DEF("uretprobe.s+",		KPROBE, 0, SEC_SLEEPABLE, attach_uprobe),
+	// SEC_DEF("kprobe.multi+",	KPROBE,	BPF_TRACE_KPROBE_MULTI, SEC_NONE, attach_kprobe_multi),
+	// SEC_DEF("kretprobe.multi+",	KPROBE,	BPF_TRACE_KPROBE_MULTI, SEC_NONE, attach_kprobe_multi),
+	// SEC_DEF("uprobe.multi+",	KPROBE,	BPF_TRACE_UPROBE_MULTI, SEC_NONE, attach_uprobe_multi),
+	// SEC_DEF("uretprobe.multi+",	KPROBE,	BPF_TRACE_UPROBE_MULTI, SEC_NONE, attach_uprobe_multi),
+	// SEC_DEF("uprobe.multi.s+",	KPROBE,	BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
+	// SEC_DEF("uretprobe.multi.s+",	KPROBE,	BPF_TRACE_UPROBE_MULTI, SEC_SLEEPABLE, attach_uprobe_multi),
+	// SEC_DEF("ksyscall+",		KPROBE,	0, SEC_NONE, attach_ksyscall),
+	// SEC_DEF("kretsyscall+",		KPROBE, 0, SEC_NONE, attach_ksyscall),
+	// SEC_DEF("usdt+",		KPROBE,	0, SEC_USDT, attach_usdt),
+	// SEC_DEF("usdt.s+",		KPROBE,	0, SEC_USDT | SEC_SLEEPABLE, attach_usdt),
+	// SEC_DEF("tc/ingress",		SCHED_CLS, BPF_TCX_INGRESS, SEC_NONE), /* alias for tcx */
+	// SEC_DEF("tc/egress",		SCHED_CLS, BPF_TCX_EGRESS, SEC_NONE),  /* alias for tcx */
+	// SEC_DEF("tcx/ingress",		SCHED_CLS, BPF_TCX_INGRESS, SEC_NONE),
+	// SEC_DEF("tcx/egress",		SCHED_CLS, BPF_TCX_EGRESS, SEC_NONE),
+	// SEC_DEF("tc",			SCHED_CLS, 0, SEC_NONE), /* deprecated / legacy, use tcx */
+	// SEC_DEF("classifier",		SCHED_CLS, 0, SEC_NONE), /* deprecated / legacy, use tcx */
+	// SEC_DEF("action",		SCHED_ACT, 0, SEC_NONE), /* deprecated / legacy, use tcx */
+	// SEC_DEF("tracepoint+",		TRACEPOINT, 0, SEC_NONE, attach_tp),
+	// SEC_DEF("tp+",			TRACEPOINT, 0, SEC_NONE, attach_tp),
+	// SEC_DEF("raw_tracepoint+",	RAW_TRACEPOINT, 0, SEC_NONE, attach_raw_tp),
+	// SEC_DEF("raw_tp+",		RAW_TRACEPOINT, 0, SEC_NONE, attach_raw_tp),
+	// SEC_DEF("raw_tracepoint.w+",	RAW_TRACEPOINT_WRITABLE, 0, SEC_NONE, attach_raw_tp),
+	// SEC_DEF("raw_tp.w+",		RAW_TRACEPOINT_WRITABLE, 0, SEC_NONE, attach_raw_tp),
+	// SEC_DEF("tp_btf+",		TRACING, BPF_TRACE_RAW_TP, SEC_ATTACH_BTF, attach_trace),
+	// SEC_DEF("fentry+",		TRACING, BPF_TRACE_FENTRY, SEC_ATTACH_BTF, attach_trace),
+	// SEC_DEF("fmod_ret+",		TRACING, BPF_MODIFY_RETURN, SEC_ATTACH_BTF, attach_trace),
+	// SEC_DEF("fexit+",		TRACING, BPF_TRACE_FEXIT, SEC_ATTACH_BTF, attach_trace),
+	// SEC_DEF("fentry.s+",		TRACING, BPF_TRACE_FENTRY, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_trace),
+	// SEC_DEF("fmod_ret.s+",		TRACING, BPF_MODIFY_RETURN, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_trace),
+	// SEC_DEF("fexit.s+",		TRACING, BPF_TRACE_FEXIT, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_trace),
+	// SEC_DEF("freplace+",		EXT, 0, SEC_ATTACH_BTF, attach_trace),
+	// SEC_DEF("lsm+",			LSM, BPF_LSM_MAC, SEC_ATTACH_BTF, attach_lsm),
+	// SEC_DEF("lsm.s+",		LSM, BPF_LSM_MAC, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_lsm),
+	// SEC_DEF("lsm_cgroup+",		LSM, BPF_LSM_CGROUP, SEC_ATTACH_BTF),
+	// SEC_DEF("iter+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF, attach_iter),
+	// SEC_DEF("iter.s+",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_iter),
+	// SEC_DEF("syscall",		SYSCALL, 0, SEC_SLEEPABLE),
+	// SEC_DEF("xdp.frags/devmap",	XDP, BPF_XDP_DEVMAP, SEC_XDP_FRAGS),
+	// SEC_DEF("xdp/devmap",		XDP, BPF_XDP_DEVMAP, SEC_ATTACHABLE),
+	// SEC_DEF("xdp.frags/cpumap",	XDP, BPF_XDP_CPUMAP, SEC_XDP_FRAGS),
+	// SEC_DEF("xdp/cpumap",		XDP, BPF_XDP_CPUMAP, SEC_ATTACHABLE),
+	// SEC_DEF("xdp.frags",		XDP, BPF_XDP, SEC_XDP_FRAGS),
+	// SEC_DEF("xdp",			XDP, BPF_XDP, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("perf_event",		PERF_EVENT, 0, SEC_NONE),
+	// SEC_DEF("lwt_in",		LWT_IN, 0, SEC_NONE),
+	// SEC_DEF("lwt_out",		LWT_OUT, 0, SEC_NONE),
+	// SEC_DEF("lwt_xmit",		LWT_XMIT, 0, SEC_NONE),
+	// SEC_DEF("lwt_seg6local",	LWT_SEG6LOCAL, 0, SEC_NONE),
+	// SEC_DEF("sockops",		SOCK_OPS, BPF_CGROUP_SOCK_OPS, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("sk_skb/stream_parser",	SK_SKB, BPF_SK_SKB_STREAM_PARSER, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("sk_skb/stream_verdict",SK_SKB, BPF_SK_SKB_STREAM_VERDICT, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("sk_skb",		SK_SKB, 0, SEC_NONE),
+	// SEC_DEF("sk_msg",		SK_MSG, BPF_SK_MSG_VERDICT, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("lirc_mode2",		LIRC_MODE2, BPF_LIRC_MODE2, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("flow_dissector",	FLOW_DISSECTOR, BPF_FLOW_DISSECTOR, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("cgroup_skb/ingress",	CGROUP_SKB, BPF_CGROUP_INET_INGRESS, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("cgroup_skb/egress",	CGROUP_SKB, BPF_CGROUP_INET_EGRESS, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("cgroup/skb",		CGROUP_SKB, 0, SEC_NONE),
+	// SEC_DEF("cgroup/sock_create",	CGROUP_SOCK, BPF_CGROUP_INET_SOCK_CREATE, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sock_release",	CGROUP_SOCK, BPF_CGROUP_INET_SOCK_RELEASE, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sock",		CGROUP_SOCK, BPF_CGROUP_INET_SOCK_CREATE, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("cgroup/post_bind4",	CGROUP_SOCK, BPF_CGROUP_INET4_POST_BIND, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/post_bind6",	CGROUP_SOCK, BPF_CGROUP_INET6_POST_BIND, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/bind4",		CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_BIND, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/bind6",		CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_BIND, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/connect4",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_CONNECT, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/connect6",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_CONNECT, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/connect_unix",	CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_CONNECT, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sendmsg4",	CGROUP_SOCK_ADDR, BPF_CGROUP_UDP4_SENDMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sendmsg6",	CGROUP_SOCK_ADDR, BPF_CGROUP_UDP6_SENDMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sendmsg_unix",	CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_SENDMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/recvmsg4",	CGROUP_SOCK_ADDR, BPF_CGROUP_UDP4_RECVMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/recvmsg6",	CGROUP_SOCK_ADDR, BPF_CGROUP_UDP6_RECVMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/recvmsg_unix",	CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_RECVMSG, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getpeername4",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_GETPEERNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getpeername6",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_GETPEERNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getpeername_unix", CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_GETPEERNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getsockname4",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET4_GETSOCKNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getsockname6",	CGROUP_SOCK_ADDR, BPF_CGROUP_INET6_GETSOCKNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getsockname_unix", CGROUP_SOCK_ADDR, BPF_CGROUP_UNIX_GETSOCKNAME, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/sysctl",	CGROUP_SYSCTL, BPF_CGROUP_SYSCTL, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/getsockopt",	CGROUP_SOCKOPT, BPF_CGROUP_GETSOCKOPT, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/setsockopt",	CGROUP_SOCKOPT, BPF_CGROUP_SETSOCKOPT, SEC_ATTACHABLE),
+	// SEC_DEF("cgroup/dev",		CGROUP_DEVICE, BPF_CGROUP_DEVICE, SEC_ATTACHABLE_OPT),
+	// SEC_DEF("struct_ops+",		STRUCT_OPS, 0, SEC_NONE),
+	// SEC_DEF("struct_ops.s+",	STRUCT_OPS, 0, SEC_SLEEPABLE),
+	// SEC_DEF("sk_lookup",		SK_LOOKUP, BPF_SK_LOOKUP, SEC_ATTACHABLE),
+	// SEC_DEF("netfilter",		NETFILTER, BPF_NETFILTER, SEC_NONE),
+};
+
+static size_t custom_sec_def_cnt;
+static struct bpf_sec_def *custom_sec_defs;
+static struct bpf_sec_def custom_fallback_def;
+static bool has_custom_fallback_def;
+static int last_custom_sec_def_handler_id;
+
+static bool sec_def_matches(const struct bpf_sec_def *sec_def, const char *sec_name)
+{
+	size_t len = strlen(sec_def->sec);
+
+	/* "type/" always has to have proper SEC("type/extras") form */
+	if (sec_def->sec[len - 1] == '/') {
+		if (str_has_pfx(sec_name, sec_def->sec))
+			return true;
+		return false;
+	}
+
+	/* "type+" means it can be either exact SEC("type") or
+	 * well-formed SEC("type/extras") with proper '/' separator
+	 */
+	if (sec_def->sec[len - 1] == '+') {
+		len--;
+		/* not even a prefix */
+		if (strncmp(sec_name, sec_def->sec, len) != 0)
+			return false;
+		/* exact match or has '/' separator */
+		if (sec_name[len] == '\0' || sec_name[len] == '/')
+			return true;
+		return false;
+	}
+
+	return strcmp(sec_name, sec_def->sec) == 0;
+}
+
+static const struct bpf_sec_def *find_sec_def(const char *sec_name)
+{
+	const struct bpf_sec_def *sec_def;
+	int i, n;
+
+	n = custom_sec_def_cnt;
+	for (i = 0; i < n; i++) {
+		sec_def = &custom_sec_defs[i];
+		if (sec_def_matches(sec_def, sec_name))
+			return sec_def;
+	}
+
+	n = ARRAY_SIZE(section_defs);
+	for (i = 0; i < n; i++) {
+		sec_def = &section_defs[i];
+		if (sec_def_matches(sec_def, sec_name))
+			return sec_def;
+	}
+
+	if (has_custom_fallback_def)
+		return &custom_fallback_def;
+
+	return NULL;
 }

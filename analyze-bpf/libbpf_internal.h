@@ -180,6 +180,9 @@ struct btf_map_def {
 int parse_btf_map_def(const char *map_name, struct btf *btf,
 		      const struct btf_type *def_t, bool strict,
 		      struct btf_map_def *map_def, struct btf_map_def *inner_def);
+void *libbpf_add_mem(void **data, size_t *cap_cnt, size_t elem_sz,
+		     size_t cur_cnt, size_t max_cnt, size_t add_cnt);
+int libbpf_ensure_mem(void **data, size_t *cap_cnt, size_t elem_sz, size_t need_cnt);
 
 static inline bool libbpf_is_mem_zeroed(const char *p, ssize_t len)
 {

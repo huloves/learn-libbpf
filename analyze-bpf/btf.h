@@ -49,6 +49,8 @@ struct btf *btf__new(const void *data, __u32 size);
  */
 struct btf *btf__new_empty(void);
 
+__s32 btf__find_by_name(const struct btf *btf,
+				   const char *type_name);
 __s32 btf__find_by_name_kind(const struct btf *btf,
 					const char *type_name, __u32 kind);
 __u32 btf__type_cnt(const struct btf *btf);

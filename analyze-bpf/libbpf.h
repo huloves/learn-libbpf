@@ -131,9 +131,39 @@ bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
 
 /* Accessors of bpf_program */
 struct bpf_program;
+
+struct bpf_program *
+bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prog);
+
+#define bpf_object__for_each_program(pos, obj)			\
+	for ((pos) = bpf_object__next_program((obj), NULL);	\
+	     (pos) != NULL;					\
+	     (pos) = bpf_object__next_program((obj), (pos)))
+
 struct bpf_link;
 
 struct bpf_map;
+
+/* get map name */
+const char *bpf_map__name(const struct bpf_map *map);
+
+/**
+ * @brief **bpf_map__is_internal()** tells the caller whether or not the
+ * passed map is a special map created by libbpf automatically for things like
+ * global variables, __ksym externs, Kconfig values, etc
+ * @param map the bpf_map
+ * @return true, if the map is an internal map; false, otherwise
+ */
+bool bpf_map__is_internal(const struct bpf_map *map);
+
+/**
+ * @brief **bpf_map__set_pin_path()** sets the path attribute that tells where the
+ * BPF map should be pinned. This does not actually create the 'pin'.
+ * @param map The bpf_map
+ * @param path The path
+ * @return 0, on success; negative error, otherwise
+ */
+int bpf_map__set_pin_path(struct bpf_map *map, const char *path);
 
 struct bpf_linker_opts {
 	/* size of this struct, for forward/backward compatibility */

@@ -1119,6 +1119,24 @@ int btf__align_of(const struct btf *btf, __u32 id)
 	}
 }
 
+__s32 btf__find_by_name(const struct btf *btf, const char *type_name)
+{
+	__u32 i, nr_types = btf__type_cnt(btf);
+
+	if (!strcmp(type_name, "void"))
+		return 0;
+
+	for (i = 1; i < nr_types; i++) {
+		const struct btf_type *t = btf__type_by_id(btf, i);
+		const char *name = btf__name_by_offset(btf, t->name_off);
+
+		if (name && !strcmp(type_name, name))
+			return i;
+	}
+
+	return libbpf_err(-ENOENT);
+}
+
 static void btf_invalidate_raw_data(struct btf *btf)
 {
 	if (btf->raw_data) {
