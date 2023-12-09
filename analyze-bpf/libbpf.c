@@ -7,9 +7,11 @@
 #include <errno.h>
 #include <gelf.h>
 #include <ctype.h>
+#include <zlib.h>
 #include <linux/err.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
 
 #include "str_error.h"
 #include "libbpf.h"
@@ -1252,6 +1254,55 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	return 0;
 }
 
+static int bpf_object__init_global_data_maps(struct bpf_object *obj)
+{
+	struct elf_sec_desc *sec_desc;
+	const char *sec_name;
+	int err = 0, sec_idx;
+
+	/*
+	 * Populate obj->maps with libbpf internal maps.
+	 */
+	for (sec_idx = 1; sec_idx < obj->efile.sec_cnt; sec_idx++) {
+		sec_desc = &obj->efile.secs[sec_idx];
+
+		/* Skip recognized sections with size 0. */
+		if (!sec_desc->data || sec_desc->data->d_size == 0)
+			continue;
+
+		switch (sec_desc->sec_type) {
+		case SEC_DATA:
+			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_DATA,
+							    sec_name, sec_idx,
+							    sec_desc->data->d_buf,
+							    sec_desc->data->d_size);
+			break;
+		case SEC_RODATA:
+			obj->has_rodata = true;
+			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_RODATA,
+							    sec_name, sec_idx,
+							    sec_desc->data->d_buf,
+							    sec_desc->data->d_size);
+			break;
+		case SEC_BSS:
+			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_BSS,
+							    sec_name, sec_idx,
+							    NULL,
+							    sec_desc->data->d_size);
+			break;
+		default:
+			/* skip */
+			break;
+		}
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
 					       const void *name)
 {
@@ -1262,6 +1313,285 @@ static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
 			return &obj->externs[i];
 	}
 	return NULL;
+}
+
+// static int set_kcfg_value_tri(struct extern_desc *ext, void *ext_val,
+// 			      char value)
+// {
+// 	switch (ext->kcfg.type) {
+// 	case KCFG_BOOL:
+// 		if (value == 'm') {
+// 			printf("extern (kcfg) '%s': value '%c' implies tristate or char type\n",
+// 				ext->name, value);
+// 			return -EINVAL;
+// 		}
+// 		*(bool *)ext_val = value == 'y' ? true : false;
+// 		break;
+// 	case KCFG_TRISTATE:
+// 		if (value == 'y')
+// 			*(enum libbpf_tristate *)ext_val = TRI_YES;
+// 		else if (value == 'm')
+// 			*(enum libbpf_tristate *)ext_val = TRI_MODULE;
+// 		else /* value == 'n' */
+// 			*(enum libbpf_tristate *)ext_val = TRI_NO;
+// 		break;
+// 	case KCFG_CHAR:
+// 		*(char *)ext_val = value;
+// 		break;
+// 	case KCFG_UNKNOWN:
+// 	case KCFG_INT:
+// 	case KCFG_CHAR_ARR:
+// 	default:
+// 		printf("extern (kcfg) '%s': value '%c' implies bool, tristate, or char type\n",
+// 			ext->name, value);
+// 		return -EINVAL;
+// 	}
+// 	ext->is_set = true;
+// 	return 0;
+// }
+
+// static int set_kcfg_value_str(struct extern_desc *ext, char *ext_val,
+// 			      const char *value)
+// {
+// 	size_t len;
+
+// 	if (ext->kcfg.type != KCFG_CHAR_ARR) {
+// 		printf("extern (kcfg) '%s': value '%s' implies char array type\n",
+// 			ext->name, value);
+// 		return -EINVAL;
+// 	}
+
+// 	len = strlen(value);
+// 	if (value[len - 1] != '"') {
+// 		printf("extern (kcfg) '%s': invalid string config '%s'\n",
+// 			ext->name, value);
+// 		return -EINVAL;
+// 	}
+
+// 	/* strip quotes */
+// 	len -= 2;
+// 	if (len >= ext->kcfg.sz) {
+// 		printf("extern (kcfg) '%s': long string '%s' of (%zu bytes) truncated to %d bytes\n",
+// 			ext->name, value, len, ext->kcfg.sz - 1);
+// 		len = ext->kcfg.sz - 1;
+// 	}
+// 	memcpy(ext_val, value + 1, len);
+// 	ext_val[len] = '\0';
+// 	ext->is_set = true;
+// 	return 0;
+// }
+
+// static int parse_u64(const char *value, __u64 *res)
+// {
+// 	char *value_end;
+// 	int err;
+
+// 	errno = 0;
+// 	*res = strtoull(value, &value_end, 0);
+// 	if (errno) {
+// 		err = -errno;
+// 		printf("failed to parse '%s' as integer: %d\n", value, err);
+// 		return err;
+// 	}
+// 	if (*value_end) {
+// 		printf("failed to parse '%s' as integer completely\n", value);
+// 		return -EINVAL;
+// 	}
+// 	return 0;
+// }
+
+// static bool is_kcfg_value_in_range(const struct extern_desc *ext, __u64 v)
+// {
+// 	int bit_sz = ext->kcfg.sz * 8;
+
+// 	if (ext->kcfg.sz == 8)
+// 		return true;
+
+// 	/* Validate that value stored in u64 fits in integer of `ext->sz`
+// 	 * bytes size without any loss of information. If the target integer
+// 	 * is signed, we rely on the following limits of integer type of
+// 	 * Y bits and subsequent transformation:
+// 	 *
+// 	 *     -2^(Y-1) <= X           <= 2^(Y-1) - 1
+// 	 *            0 <= X + 2^(Y-1) <= 2^Y - 1
+// 	 *            0 <= X + 2^(Y-1) <  2^Y
+// 	 *
+// 	 *  For unsigned target integer, check that all the (64 - Y) bits are
+// 	 *  zero.
+// 	 */
+// 	if (ext->kcfg.is_signed)
+// 		return v + (1ULL << (bit_sz - 1)) < (1ULL << bit_sz);
+// 	else
+// 		return (v >> bit_sz) == 0;
+// }
+
+// static int set_kcfg_value_num(struct extern_desc *ext, void *ext_val,
+// 			      __u64 value)
+// {
+// 	if (ext->kcfg.type != KCFG_INT && ext->kcfg.type != KCFG_CHAR &&
+// 	    ext->kcfg.type != KCFG_BOOL) {
+// 		printf("extern (kcfg) '%s': value '%llu' implies integer, char, or boolean type\n",
+// 			ext->name, (unsigned long long)value);
+// 		return -EINVAL;
+// 	}
+// 	if (ext->kcfg.type == KCFG_BOOL && value > 1) {
+// 		printf("extern (kcfg) '%s': value '%llu' isn't boolean compatible\n",
+// 			ext->name, (unsigned long long)value);
+// 		return -EINVAL;
+
+// 	}
+// 	if (!is_kcfg_value_in_range(ext, value)) {
+// 		printf("extern (kcfg) '%s': value '%llu' doesn't fit in %d bytes\n",
+// 			ext->name, (unsigned long long)value, ext->kcfg.sz);
+// 		return -ERANGE;
+// 	}
+// 	switch (ext->kcfg.sz) {
+// 	case 1:
+// 		*(__u8 *)ext_val = value;
+// 		break;
+// 	case 2:
+// 		*(__u16 *)ext_val = value;
+// 		break;
+// 	case 4:
+// 		*(__u32 *)ext_val = value;
+// 		break;
+// 	case 8:
+// 		*(__u64 *)ext_val = value;
+// 		break;
+// 	default:
+// 		return -EINVAL;
+// 	}
+// 	ext->is_set = true;
+// 	return 0;
+// }
+
+// static int bpf_object__process_kconfig_line(struct bpf_object *obj,
+// 					    char *buf, void *data)
+// {
+// 	struct extern_desc *ext;
+// 	char *sep, *value;
+// 	int len, err = 0;
+// 	void *ext_val;
+// 	__u64 num;
+
+// 	if (!str_has_pfx(buf, "CONFIG_"))
+// 		return 0;
+
+// 	sep = strchr(buf, '=');
+// 	if (!sep) {
+// 		printf("failed to parse '%s': no separator\n", buf);
+// 		return -EINVAL;
+// 	}
+
+// 	/* Trim ending '\n' */
+// 	len = strlen(buf);
+// 	if (buf[len - 1] == '\n')
+// 		buf[len - 1] = '\0';
+// 	/* Split on '=' and ensure that a value is present. */
+// 	*sep = '\0';
+// 	if (!sep[1]) {
+// 		*sep = '=';
+// 		printf("failed to parse '%s': no value\n", buf);
+// 		return -EINVAL;
+// 	}
+
+// 	ext = find_extern_by_name(obj, buf);
+// 	if (!ext || ext->is_set)
+// 		return 0;
+
+// 	ext_val = data + ext->kcfg.data_off;
+// 	value = sep + 1;
+
+// 	switch (*value) {
+// 	case 'y': case 'n': case 'm':
+// 		err = set_kcfg_value_tri(ext, ext_val, *value);
+// 		break;
+// 	case '"':
+// 		err = set_kcfg_value_str(ext, ext_val, value);
+// 		break;
+// 	default:
+// 		/* assume integer */
+// 		err = parse_u64(value, &num);
+// 		if (err) {
+// 			printf("extern (kcfg) '%s': value '%s' isn't a valid integer\n", ext->name, value);
+// 			return err;
+// 		}
+// 		if (ext->kcfg.type != KCFG_INT && ext->kcfg.type != KCFG_CHAR) {
+// 			printf("extern (kcfg) '%s': value '%s' implies integer type\n", ext->name, value);
+// 			return -EINVAL;
+// 		}
+// 		err = set_kcfg_value_num(ext, ext_val, num);
+// 		break;
+// 	}
+// 	if (err)
+// 		return err;
+// 	printf("extern (kcfg) '%s': set to %s\n", ext->name, value);
+// 	return 0;
+// }
+
+// static int bpf_object__read_kconfig_file(struct bpf_object *obj, void *data)
+// {
+// 	char buf[PATH_MAX];
+// 	struct utsname uts;
+// 	int len, err = 0;
+// 	gzFile file;
+
+// 	uname(&uts);
+// 	len = snprintf(buf, PATH_MAX, "/boot/config-%s", uts.release);
+// 	if (len < 0)
+// 		return -EINVAL;
+// 	else if (len >= PATH_MAX)
+// 		return -ENAMETOOLONG;
+
+// 	/* gzopen also accepts uncompressed files. */
+// 	file = gzopen(buf, "re");
+// 	if (!file)
+// 		file = gzopen("/proc/config.gz", "re");
+
+// 	if (!file) {
+// 		printf("failed to open system Kconfig\n");
+// 		return -ENOENT;
+// 	}
+
+// 	while (gzgets(file, buf, sizeof(buf))) {
+// 		err = bpf_object__process_kconfig_line(obj, buf, data);
+// 		if (err) {
+// 			printf("error parsing system Kconfig line '%s': %d\n",
+// 				buf, err);
+// 			goto out;
+// 		}
+// 	}
+
+// out:
+// 	gzclose(file);
+// 	return err;
+// }
+
+static int bpf_object__init_kconfig_map(struct bpf_object *obj)
+{
+	struct extern_desc *last_ext = NULL, *ext;
+	size_t map_sz;
+	int i, err;
+
+	for (i = 0; i < obj->nr_extern; i++) {
+		ext = &obj->externs[i];
+		if (ext->type == EXT_KCFG)
+			last_ext = ext;
+	}
+
+	if (!last_ext)
+		return 0;
+
+	map_sz = last_ext->kcfg.data_off + last_ext->kcfg.sz;
+	err = bpf_object__init_internal_map(obj, LIBBPF_MAP_KCONFIG,
+					    ".kconfig", obj->efile.symbols_shndx,
+					    NULL, map_sz);
+	if (err)
+		return err;
+
+	obj->kconfig_map_idx = obj->nr_maps - 1;
+
+	return 0;
 }
 
 static bool libbpf_needs_btf(const struct bpf_object *obj)
@@ -2905,7 +3235,13 @@ static int bpf_object__init_user_btf_maps(struct bpf_object *obj, bool strict,
 	if (obj->efile.btf_maps_shndx < 0)
 		return 0;
 
+	/**
+	 * 获取.map的section header
+	 */
 	scn = elf_sec_by_idx(obj, obj->efile.btf_maps_shndx);
+	/**
+	 * 获取.map的section data
+	 */
 	data = elf_sec_data(obj, scn);
 	if (!scn || !data) {
 		printf("elf: failed to get %s map definitions for %s\n",
@@ -2955,8 +3291,8 @@ static int bpf_object__init_maps(struct bpf_object *obj,
 	pin_root_path = OPTS_GET(opts, pin_root_path, NULL);
 
 	err = bpf_object__init_user_btf_maps(obj, strict, pin_root_path);
-	// err = err ?: bpf_object__init_global_data_maps(obj);
-	// err = err ?: bpf_object__init_kconfig_map(obj);
+	err = err ?: bpf_object__init_global_data_maps(obj);
+	err = err ?: bpf_object__init_kconfig_map(obj);
 	// err = err ?: bpf_object_init_struct_ops(obj);
 
 	return err;

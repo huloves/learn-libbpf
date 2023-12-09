@@ -165,6 +165,12 @@ bool bpf_map__is_internal(const struct bpf_map *map);
  */
 int bpf_map__set_pin_path(struct bpf_map *map, const char *path);
 
+enum libbpf_tristate {
+	TRI_NO = 0,
+	TRI_YES = 1,
+	TRI_MODULE = 2,
+};
+
 struct bpf_linker_opts {
 	/* size of this struct, for forward/backward compatibility */
 	size_t sz;

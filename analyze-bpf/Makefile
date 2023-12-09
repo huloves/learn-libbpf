@@ -47,7 +47,7 @@ $(BUILD_DIR)/gen.o: bpftool/gen.c
 	gcc $(INCLUDE_BPFTOOL) -c -o $@ $^
 
 $(BUILD_DIR)/bpftool: $(OBJS_LIBTOOL) $(BUILD_DIR)/libbpf.a
-	gcc $(OBJS_LIBTOOL) -o $@ -L./build/ -lbpf -lelf
+	gcc $(OBJS_LIBTOOL) -o $@ -L./build/ -lbpf -lelf -lz
 
 clean:
 	cd $(BUILD_DIR) && rm -rf ./*
