@@ -1119,6 +1119,26 @@ int btf__align_of(const struct btf *btf, __u32 id)
 	}
 }
 
+int btf__resolve_type(const struct btf *btf, __u32 type_id)
+{
+	const struct btf_type *t;
+	int depth = 0;
+
+	t = btf__type_by_id(btf, type_id);
+	while (depth < MAX_RESOLVE_DEPTH &&
+	       !btf_type_is_void_or_null(t) &&
+	       (btf_is_mod(t) || btf_is_typedef(t) || btf_is_var(t))) {
+		type_id = t->type;
+		t = btf__type_by_id(btf, type_id);
+		depth++;
+	}
+
+	if (depth == MAX_RESOLVE_DEPTH || btf_type_is_void_or_null(t))
+		return libbpf_err(-EINVAL);
+
+	return type_id;
+}
+
 __s32 btf__find_by_name(const struct btf *btf, const char *type_name)
 {
 	__u32 i, nr_types = btf__type_cnt(btf);
