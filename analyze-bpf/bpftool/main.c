@@ -14,6 +14,7 @@ static int last_argc;
 static char **last_argv;
 static int (*last_do_help)(int argc, char **argv);
 bool verifier_logs;
+bool use_loader;
 
 void usage(void)
 {

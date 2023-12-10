@@ -11,7 +11,7 @@ OBJS_LIBTOOL = $(BUILD_DIR)/main.o $(BUILD_DIR)/gen.o
 
 OBJS_LIBBPF = $(BUILD_DIR)/linker.o $(BUILD_DIR)/hashmap.o $(BUILD_DIR)/strset.o \
 	$(BUILD_DIR)/btf.o $(BUILD_DIR)/libbpf.o $(BUILD_DIR)/usdt.o $(BUILD_DIR)/libbpf_probes.o \
-	$(BUILD_DIR)/str_error.o
+	$(BUILD_DIR)/str_error.o $(BUILD_DIR)/gen_loader.o $(BUILD_DIR)/libbpf_errno.o $(BUILD_DIR)/btf_dump.o
 
 $(BUILD_DIR)/linker.o: linker.c
 	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
@@ -35,6 +35,15 @@ $(BUILD_DIR)/libbpf_probes.o: libbpf_probes.c
 	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
 
 $(BUILD_DIR)/str_error.o: str_error.c
+	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
+
+$(BUILD_DIR)/gen_loader.o: gen_loader.c
+	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
+
+$(BUILD_DIR)/libbpf_errno.o: libbpf_errno.c
+	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
+
+$(BUILD_DIR)/btf_dump.o: btf_dump.c
 	gcc $(INCLUDE_LIBBPF) -c -o $@ $^
 
 $(BUILD_DIR)/libbpf.a: $(OBJS_LIBBPF)

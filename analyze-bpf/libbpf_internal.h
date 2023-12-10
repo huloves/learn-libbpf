@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdlib.h>
+#include <string.h>
 #include <limits.h>
 #include <errno.h>
 #include <linux/err.h>
@@ -13,6 +13,8 @@
 #include "btf.h"
 
 #include "include/uapi/linux/btf.h"
+#include "include/uapi/linux/bpf_common.h"
+#include "include/uapi/linux/bpf.h"
 
 #ifndef EM_BPF
 #define EM_BPF 247
@@ -371,6 +373,15 @@ static inline bool str_is_empty(const char *s)
 {
 	return !s || !s[0];
 }
+
+static inline bool is_ldimm64_insn(struct bpf_insn *insn)
+{
+	return insn->code == (BPF_LD | BPF_IMM | BPF_DW);
+}
+
+struct usdt_manager;
+
+void usdt_manager_free(struct usdt_manager *man);
 
 static inline bool is_pow_of_2(size_t x)
 {

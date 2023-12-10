@@ -32,6 +32,7 @@
 	"LINK := { id LINK_ID | pinned FILE }"
 
 extern bool verifier_logs;
+extern bool use_loader;
 
 bool is_prefix(const char *pfx, const char *str);
 

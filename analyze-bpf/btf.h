@@ -97,6 +97,36 @@ struct btf_dedup_opts {
 
 int btf__dedup(struct btf *btf, const struct btf_dedup_opts *opts);
 
+struct btf_dump;
+
+struct btf_dump_opts {
+	size_t sz;
+};
+#define btf_dump_opts__last_field sz
+
+typedef void (*btf_dump_printf_fn_t)(void *ctx, const char *fmt, va_list args);
+
+struct btf_dump_emit_type_decl_opts {
+	/* size of this struct, for forward/backward compatiblity */
+	size_t sz;
+	/* optional field name for type declaration, e.g.:
+	 * - struct my_struct <FNAME>
+	 * - void (*<FNAME>)(int)
+	 * - char (*<FNAME>)[123]
+	 */
+	const char *field_name;
+	/* extra indentation level (in number of tabs) to emit for multi-line
+	 * type declarations (e.g., anonymous struct); applies for lines
+	 * starting from the second one (first line is assumed to have
+	 * necessary indentation already
+	 */
+	int indent_level;
+	/* strip all the const/volatile/restrict mods */
+	bool strip_mods;
+	size_t :0;
+};
+#define btf_dump_emit_type_decl_opts__last_field strip_mods
+
 /*
  * A set of helpers for easier BTF types handling.
  *

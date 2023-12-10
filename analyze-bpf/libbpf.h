@@ -30,6 +30,8 @@ enum libbpf_errno {
 	__LIBBPF_ERRNO__END,
 };
 
+int libbpf_strerror(int err, char *buf, size_t size);
+
 enum libbpf_print_level {
         LIBBPF_WARN,
         LIBBPF_INFO,
@@ -129,6 +131,20 @@ struct bpf_object *
 bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
 		     const struct bpf_object_open_opts *opts);
 
+/**
+ * @brief **bpf_object__close()** closes a BPF object and releases all
+ * resources.
+ * @param obj Pointer to a valid BPF object
+ */
+void bpf_object__close(struct bpf_object *obj);
+
+const char *bpf_object__name(const struct bpf_object *obj);
+unsigned int bpf_object__kversion(const struct bpf_object *obj);
+int bpf_object__set_kversion(struct bpf_object *obj, __u32 kern_version);
+
+struct btf;
+struct btf *bpf_object__btf(const struct bpf_object *obj);
+
 /* Accessors of bpf_program */
 struct bpf_program;
 
@@ -140,9 +156,31 @@ bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prog)
 	     (pos) != NULL;					\
 	     (pos) = bpf_object__next_program((obj), (pos)))
 
+const char *bpf_program__name(const struct bpf_program *prog);
+
 struct bpf_link;
 
 struct bpf_map;
+
+/**
+ * @brief **bpf_object__find_map_by_name()** returns BPF map of
+ * the given name, if it exists within the passed BPF object
+ * @param obj BPF object
+ * @param name name of the BPF map
+ * @return BPF map instance, if such map exists within the BPF object;
+ * or NULL otherwise.
+ */
+struct bpf_map *
+bpf_object__find_map_by_name(const struct bpf_object *obj, const char *name);
+
+struct bpf_map *
+bpf_object__next_map(const struct bpf_object *obj, const struct bpf_map *map);
+
+#define bpf_object__for_each_map(pos, obj)		\
+	for ((pos) = bpf_object__next_map((obj), NULL);	\
+	     (pos) != NULL;				\
+	     (pos) = bpf_object__next_map((obj), (pos)))
+#define bpf_map__for_each bpf_object__for_each_map
 
 /* get map name */
 const char *bpf_map__name(const struct bpf_map *map);

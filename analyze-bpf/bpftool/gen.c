@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -14,6 +15,7 @@
 #include <sys/mman.h>
 #include <linux/kernel.h>
 
+#include "../btf.h"
 #include "../libbpf.h"
 #include "../libbpf_legacy.h"
 
@@ -57,6 +59,210 @@ static void get_obj_name(char *name, const char *file)
 	if (str_has_suffix(name, ".o"))
 		name[strlen(name) - 2] = '\0';
 	sanitize_identifier(name);
+}
+
+static void get_header_guard(char *guard, const char *obj_name, const char *suffix)
+{
+	int i;
+
+	sprintf(guard, "__%s_%s__", obj_name, suffix);
+	for (i = 0; guard[i]; i++)
+		guard[i] = toupper(guard[i]);
+}
+
+static bool get_map_ident(const struct bpf_map *map, char *buf, size_t buf_sz)
+{
+	static const char *sfxs[] = { ".data", ".rodata", ".bss", ".kconfig" };
+	const char *name = bpf_map__name(map);
+	int i, n;
+
+	if (!bpf_map__is_internal(map)) {
+		snprintf(buf, buf_sz, "%s", name);
+		return true;
+	}
+
+	for  (i = 0, n = ARRAY_SIZE(sfxs); i < n; i++) {
+		const char *sfx = sfxs[i], *p;
+
+		p = strstr(name, sfx);
+		if (p) {
+			snprintf(buf, buf_sz, "%s", p + 1);
+			sanitize_identifier(buf);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool get_datasec_ident(const char *sec_name, char *buf, size_t buf_sz)
+{
+	static const char *pfxs[] = { ".data", ".rodata", ".bss", ".kconfig" };
+	int i, n;
+
+	for  (i = 0, n = ARRAY_SIZE(pfxs); i < n; i++) {
+		const char *pfx = pfxs[i];
+
+		if (str_has_prefix(sec_name, pfx)) {
+			snprintf(buf, buf_sz, "%s", sec_name + 1);
+			sanitize_identifier(buf);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void codegen_btf_dump_printf(void *ctx, const char *fmt, va_list args)
+{
+	vprintf(fmt, args);
+}
+
+static int codegen_datasec_def(struct bpf_object *obj,
+			       struct btf *btf,
+			       struct btf_dump *d,
+			       const struct btf_type *sec,
+			       const char *obj_name)
+{
+	const char *sec_name = btf__name_by_offset(btf, sec->name_off);
+	const struct btf_var_secinfo *sec_var = btf_var_secinfos(sec);
+	int i, err, off = 0, pad_cnt = 0, vlen = btf_vlen(sec);
+	char var_ident[256], sec_ident[256];
+	bool strip_mods = false;
+
+	if (!get_datasec_ident(sec_name, sec_ident, sizeof(sec_ident)))
+		return 0;
+
+	if (strcmp(sec_name, ".kconfig") != 0)
+		strip_mods = true;
+
+	printf("	struct %s__%s {\n", obj_name, sec_ident);
+	for (i = 0; i < vlen; i++, sec_var++) {
+		const struct btf_type *var = btf__type_by_id(btf, sec_var->type);
+		const char *var_name = btf__name_by_offset(btf, var->name_off);
+		DECLARE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts, opts,
+			.field_name = var_ident,
+			.indent_level = 2,
+			.strip_mods = strip_mods,
+		);
+		int need_off = sec_var->offset, align_off, align;
+		__u32 var_type_id = var->type;
+
+		/* static variables are not exposed through BPF skeleton */
+		if (btf_var(var)->linkage == BTF_VAR_STATIC)
+			continue;
+
+		if (off > need_off) {
+			printf("Something is wrong for %s's variable #%d: need offset %d, already at %d.\n",
+			      sec_name, i, need_off, off);
+			return -EINVAL;
+		}
+
+		align = btf__align_of(btf, var->type);
+		if (align <= 0) {
+			printf("Failed to determine alignment of variable '%s': %d",
+			      var_name, align);
+			return -EINVAL;
+		}
+		/* Assume 32-bit architectures when generating data section
+		 * struct memory layout. Given bpftool can't know which target
+		 * host architecture it's emitting skeleton for, we need to be
+		 * conservative and assume 32-bit one to ensure enough padding
+		 * bytes are generated for pointer and long types. This will
+		 * still work correctly for 64-bit architectures, because in
+		 * the worst case we'll generate unnecessary padding field,
+		 * which on 64-bit architectures is not strictly necessary and
+		 * would be handled by natural 8-byte alignment. But it still
+		 * will be a correct memory layout, based on recorded offsets
+		 * in BTF.
+		 */
+		if (align > 4)
+			align = 4;
+
+		align_off = (off + align - 1) / align * align;
+		if (align_off != need_off) {
+			printf("\t\tchar __pad%d[%d];\n",
+			       pad_cnt, need_off - off);
+			pad_cnt++;
+		}
+
+		/* sanitize variable name, e.g., for static vars inside
+		 * a function, it's name is '<function name>.<variable name>',
+		 * which we'll turn into a '<function name>_<variable name>'
+		 */
+		var_ident[0] = '\0';
+		strncat(var_ident, var_name, sizeof(var_ident) - 1);
+		sanitize_identifier(var_ident);
+
+		printf("\t\t");
+		// err = btf_dump__emit_type_decl(d, var_type_id, &opts);
+		if (err)
+			return err;
+		printf(";\n");
+
+		off = sec_var->offset + sec_var->size;
+	}
+	printf("	} *%s;\n", sec_ident);
+	return 0;
+}
+
+static void codegen(const char *template, ...)
+{
+	const char *src, *end;
+	int skip_tabs = 0, n;
+	char *s, *dst;
+	va_list args;
+	char c;
+
+	n = strlen(template);
+	s = malloc(n + 1);
+	if (!s)
+		exit(-1);
+	src = template;
+	dst = s;
+
+	/* find out "baseline" indentation to skip */
+	while ((c = *src++)) {
+		if (c == '\t') {
+			skip_tabs++;
+		} else if (c == '\n') {
+			break;
+		} else {
+			printf("unrecognized character at pos %td in template '%s': '%c'",
+			      src - template - 1, template, c);
+			free(s);
+			exit(-1);
+		}
+	}
+
+	while (*src) {
+		/* skip baseline indentation tabs */
+		for (n = skip_tabs; n > 0; n--, src++) {
+			if (*src != '\t') {
+				printf("not enough tabs at pos %td in template '%s'",
+				      src - template - 1, template);
+				free(s);
+				exit(-1);
+			}
+		}
+		/* trim trailing whitespace */
+		end = strchrnul(src, '\n');
+		for (n = end - src; n > 0 && isspace(src[n - 1]); n--)
+			;
+		memcpy(dst, src, n);
+		dst += n;
+		if (*end)
+			*dst++ = '\n';
+		src = *end ? end + 1 : end;
+	}
+	*dst++ = '\0';
+
+	/* print out using adjusted template */
+	va_start(args, template);
+	n = vprintf(s, args);
+	va_end(args);
+
+	free(s);
 }
 
 /**
@@ -132,6 +338,103 @@ static int do_skeleton(int argc, char **argv)
 		opts.kernel_log_level = 1 + 2 + 4;
 	}
 	obj = bpf_object__open_mem(obj_data, file_sz, &opts);
+	if (!obj) {
+		char err_buf[256];
+
+		err = -errno;
+		libbpf_strerror(err, err_buf, sizeof(err_buf));
+		printf("failed to open BPF object file: %s", err_buf);
+		goto out;
+	}
+
+	bpf_object__for_each_map(map, obj) {
+		if (!get_map_ident(map, ident, sizeof(ident))) {
+			printf("ignoring unrecognized internal map '%s'...\n",
+			      bpf_map__name(map));
+			continue;
+		}
+		map_cnt++;
+	}
+	bpf_object__for_each_program(prog, obj) {
+		prog_cnt++;
+	}
+
+	get_header_guard(header_guard, obj_name, "SKEL_H");
+	if (use_loader) {
+		codegen("\
+		\n\
+		/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */   \n\
+		/* THIS FILE IS AUTOGENERATED BY BPFTOOL! */		    \n\
+		#ifndef %2$s						    \n\
+		#define %2$s						    \n\
+									    \n\
+		#include <bpf/skel_internal.h>				    \n\
+									    \n\
+		struct %1$s {						    \n\
+			struct bpf_loader_ctx ctx;			    \n\
+		",
+		obj_name, header_guard
+		);
+	} else {
+		codegen("\
+		\n\
+		/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */   \n\
+									    \n\
+		/* THIS FILE IS AUTOGENERATED BY BPFTOOL! */		    \n\
+		#ifndef %2$s						    \n\
+		#define %2$s						    \n\
+									    \n\
+		#include <errno.h>					    \n\
+		#include <stdlib.h>					    \n\
+		#include <bpf/libbpf.h>					    \n\
+									    \n\
+		struct %1$s {						    \n\
+			struct bpf_object_skeleton *skeleton;		    \n\
+			struct bpf_object *obj;				    \n\
+		",
+		obj_name, header_guard
+		);
+	}
+
+	if (map_cnt) {
+		printf("\tstruct {\n");
+		bpf_object__for_each_map(map, obj) {
+			if (!get_map_ident(map, ident, sizeof(ident)))
+				continue;
+			if (use_loader)
+				printf("\t\tstruct bpf_map_desc %s;\n", ident);
+			else
+				printf("\t\tstruct bpf_map *%s;\n", ident);
+		}
+		printf("\t} maps;\n");
+	}
+
+	if (prog_cnt) {
+		printf("\tstruct {\n");
+		bpf_object__for_each_program(prog, obj) {
+			if (use_loader)
+				printf("\t\tstruct bpf_prog_desc %s;\n",
+				       bpf_program__name(prog));
+			else
+				printf("\t\tstruct bpf_program *%s;\n",
+				       bpf_program__name(prog));
+		}
+		printf("\t} progs;\n");
+		printf("\tstruct {\n");
+		bpf_object__for_each_program(prog, obj) {
+			if (use_loader)
+				printf("\t\tint %s_fd;\n",
+				       bpf_program__name(prog));
+			else
+				printf("\t\tstruct bpf_link *%s;\n",
+				       bpf_program__name(prog));
+		}
+		printf("\t} links;\n");
+	}
+
+	btf = bpf_object__btf(obj);
+out:
+	return err;
 }
 
 static int do_object(int argc, char **argv)
