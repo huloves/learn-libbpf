@@ -769,6 +769,7 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 				sec_name, name);
 			return -ENOMEM;
 		}
+		obj->programs = progs;
 
 		/**
 		 * 指向新增的bpf_program
