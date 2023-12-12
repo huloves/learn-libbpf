@@ -114,6 +114,8 @@ struct btf_dump *btf_dump__new(const struct btf *btf,
 
 void btf_dump__free(struct btf_dump *d);
 
+int btf_dump__dump_type(struct btf_dump *d, __u32 id);
+
 struct btf_dump_emit_type_decl_opts {
 	/* size of this struct, for forward/backward compatiblity */
 	size_t sz;
@@ -134,6 +136,10 @@ struct btf_dump_emit_type_decl_opts {
 	size_t :0;
 };
 #define btf_dump_emit_type_decl_opts__last_field strip_mods
+
+int
+btf_dump__emit_type_decl(struct btf_dump *d, __u32 id,
+			 const struct btf_dump_emit_type_decl_opts *opts);
 
 struct btf_dump_type_data_opts {
 	/* size of this struct, for forward/backward compatibility */

@@ -157,10 +157,16 @@ bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prog)
 	     (pos) = bpf_object__next_program((obj), (pos)))
 
 const char *bpf_program__name(const struct bpf_program *prog);
+const char *bpf_program__section_name(const struct bpf_program *prog);
 
 struct bpf_link;
 
 struct bpf_map;
+
+enum bpf_prog_type bpf_program__type(const struct bpf_program *prog);
+
+enum bpf_attach_type
+bpf_program__expected_attach_type(const struct bpf_program *prog);
 
 /**
  * @brief **bpf_object__find_map_by_name()** returns BPF map of
@@ -184,6 +190,12 @@ bpf_object__next_map(const struct bpf_object *obj, const struct bpf_map *map);
 
 /* get map name */
 const char *bpf_map__name(const struct bpf_map *map);
+/* get/set map size (max_entries) */
+__u32 bpf_map__max_entries(const struct bpf_map *map);
+/* get/set map flags */
+__u32 bpf_map__map_flags(const struct bpf_map *map);
+/* get map value size */
+__u32 bpf_map__value_size(const struct bpf_map *map);
 
 /**
  * @brief **bpf_map__is_internal()** tells the caller whether or not the
@@ -202,6 +214,18 @@ bool bpf_map__is_internal(const struct bpf_map *map);
  * @return 0, on success; negative error, otherwise
  */
 int bpf_map__set_pin_path(struct bpf_map *map, const char *path);
+
+struct gen_loader_opts {
+	size_t sz; /* size of this struct, for forward/backward compatibility */
+	const char *data;
+	const char *insns;
+	__u32 data_sz;
+	__u32 insns_sz;
+};
+
+#define gen_loader_opts__last_field insns_sz
+int bpf_object__gen_loader(struct bpf_object *obj,
+				struct gen_loader_opts *opts);
 
 enum libbpf_tristate {
 	TRI_NO = 0,

@@ -4505,6 +4505,22 @@ int bpf_object__set_kversion(struct bpf_object *obj, __u32 kern_version)
 	return 0;
 }
 
+int bpf_object__gen_loader(struct bpf_object *obj, struct gen_loader_opts *opts)
+{
+	struct bpf_gen *gen;
+
+	if (!opts)
+		return -EFAULT;
+	if (!OPTS_VALID(opts, gen_loader_opts))
+		return -EINVAL;
+	gen = calloc(sizeof(*gen), 1);
+	if (!gen)
+		return -ENOMEM;
+	gen->opts = opts;
+	obj->gen_loader = gen;
+	return 0;
+}
+
 static struct bpf_program *
 __bpf_program__iter(const struct bpf_program *p, const struct bpf_object *obj,
 		    bool forward)
@@ -4546,6 +4562,11 @@ bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prev)
 const char *bpf_program__name(const struct bpf_program *prog)
 {
 	return prog->name;
+}
+
+const char *bpf_program__section_name(const struct bpf_program *prog)
+{
+	return prog->sec_name;
 }
 
 static bool map_uses_real_name(const struct bpf_map *map)
@@ -4688,11 +4709,21 @@ static const struct bpf_sec_def section_defs[] = {
 	// SEC_DEF("netfilter",		NETFILTER, BPF_NETFILTER, SEC_NONE),
 };
 
+enum bpf_prog_type bpf_program__type(const struct bpf_program *prog)
+{
+	return prog->type;
+}
+
 static size_t custom_sec_def_cnt;
 static struct bpf_sec_def *custom_sec_defs;
 static struct bpf_sec_def custom_fallback_def;
 static bool has_custom_fallback_def;
 static int last_custom_sec_def_handler_id;
+
+enum bpf_attach_type bpf_program__expected_attach_type(const struct bpf_program *prog)
+{
+	return prog->expected_attach_type;
+}
 
 static bool sec_def_matches(const struct bpf_sec_def *sec_def, const char *sec_name)
 {
@@ -4978,4 +5009,19 @@ bpf_object__find_map_by_name(const struct bpf_object *obj, const char *name)
 			return pos;
 	}
 	return errno = ENOENT, NULL;
+}
+
+__u32 bpf_map__max_entries(const struct bpf_map *map)
+{
+	return map->def.max_entries;
+}
+
+__u32 bpf_map__map_flags(const struct bpf_map *map)
+{
+	return map->def.map_flags;
+}
+
+__u32 bpf_map__value_size(const struct bpf_map *map)
+{
+	return map->def.value_size;
 }

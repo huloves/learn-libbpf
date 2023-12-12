@@ -195,7 +195,7 @@ static int codegen_datasec_def(struct bpf_object *obj,
 		sanitize_identifier(var_ident);
 
 		printf("\t\t");
-		// err = btf_dump__emit_type_decl(d, var_type_id, &opts);
+		err = btf_dump__emit_type_decl(d, var_type_id, &opts);
 		if (err)
 			return err;
 		printf(";\n");
@@ -204,6 +204,82 @@ static int codegen_datasec_def(struct bpf_object *obj,
 	}
 	printf("	} *%s;\n", sec_ident);
 	return 0;
+}
+
+static const struct btf_type *find_type_for_map(struct btf *btf, const char *map_ident)
+{
+	int n = btf__type_cnt(btf), i;
+	char sec_ident[256];
+
+	for (i = 1; i < n; i++) {
+		const struct btf_type *t = btf__type_by_id(btf, i);
+		const char *name;
+
+		if (!btf_is_datasec(t))
+			continue;
+
+		name = btf__str_by_offset(btf, t->name_off);
+		if (!get_datasec_ident(name, sec_ident, sizeof(sec_ident)))
+			continue;
+
+		if (strcmp(sec_ident, map_ident) == 0)
+			return t;
+	}
+	return NULL;
+}
+
+static bool is_internal_mmapable_map(const struct bpf_map *map, char *buf, size_t sz)
+{
+	if (!bpf_map__is_internal(map) || !(bpf_map__map_flags(map) & BPF_F_MMAPABLE))
+		return false;
+
+	if (!get_map_ident(map, buf, sz))
+		return false;
+
+	return true;
+}
+
+static int codegen_datasecs(struct bpf_object *obj, const char *obj_name)
+{
+	struct btf *btf = bpf_object__btf(obj);
+	struct btf_dump *d;
+	struct bpf_map *map;
+	const struct btf_type *sec;
+	char map_ident[256];
+	int err = 0;
+
+	d = btf_dump__new(btf, codegen_btf_dump_printf, NULL, NULL);
+	if (!d)
+		return -errno;
+
+	bpf_object__for_each_map(map, obj) {
+		/* only generate definitions for memory-mapped internal maps */
+		if (!is_internal_mmapable_map(map, map_ident, sizeof(map_ident)))
+			continue;
+
+		sec = find_type_for_map(btf, map_ident);
+
+		/* In some cases (e.g., sections like .rodata.cst16 containing
+		 * compiler allocated string constants only) there will be
+		 * special internal maps with no corresponding DATASEC BTF
+		 * type. In such case, generate empty structs for each such
+		 * map. It will still be memory-mapped and its contents
+		 * accessible from user-space through BPF skeleton.
+		 */
+		if (!sec) {
+			printf("	struct %s__%s {\n", obj_name, map_ident);
+			printf("	} *%s;\n", map_ident);
+		} else {
+			err = codegen_datasec_def(obj, btf, d, sec, obj_name);
+			if (err)
+				goto out;
+		}
+	}
+
+
+out:
+	btf_dump__free(d);
+	return err;
 }
 
 static void codegen(const char *template, ...)
@@ -263,6 +339,227 @@ static void codegen(const char *template, ...)
 	va_end(args);
 
 	free(s);
+}
+
+static void print_hex(const char *data, int data_sz)
+{
+	int i, len;
+
+	for (i = 0, len = 0; i < data_sz; i++) {
+		int w = data[i] ? 4 : 2;
+
+		len += w;
+		if (len > 78) {
+			printf("\\\n");
+			len = w;
+		}
+		if (!data[i])
+			printf("\\0");
+		else
+			printf("\\x%02x", (unsigned char)data[i]);
+	}
+}
+
+static size_t bpf_map_mmap_sz(const struct bpf_map *map)
+{
+	long page_sz = sysconf(_SC_PAGE_SIZE);
+	size_t map_sz;
+
+	map_sz = (size_t)roundup(bpf_map__value_size(map), 8) * bpf_map__max_entries(map);
+	map_sz = roundup(map_sz, page_sz);
+	return map_sz;
+}
+
+/* Emit type size asserts for all top-level fields in memory-mapped internal maps. */
+static void codegen_asserts(struct bpf_object *obj, const char *obj_name)
+{
+	struct btf *btf = bpf_object__btf(obj);
+	struct bpf_map *map;
+	struct btf_var_secinfo *sec_var;
+	int i, vlen;
+	const struct btf_type *sec;
+	char map_ident[256], var_ident[256];
+
+	if (!btf)
+		return;
+
+	codegen("\
+		\n\
+		__attribute__((unused)) static void			    \n\
+		%1$s__assert(struct %1$s *s __attribute__((unused)))	    \n\
+		{							    \n\
+		#ifdef __cplusplus					    \n\
+		#define _Static_assert static_assert			    \n\
+		#endif							    \n\
+		", obj_name);
+
+	bpf_object__for_each_map(map, obj) {
+		if (!is_internal_mmapable_map(map, map_ident, sizeof(map_ident)))
+			continue;
+
+		sec = find_type_for_map(btf, map_ident);
+		if (!sec) {
+			/* best effort, couldn't find the type for this map */
+			continue;
+		}
+
+		sec_var = btf_var_secinfos(sec);
+		vlen =  btf_vlen(sec);
+
+		for (i = 0; i < vlen; i++, sec_var++) {
+			const struct btf_type *var = btf__type_by_id(btf, sec_var->type);
+			const char *var_name = btf__name_by_offset(btf, var->name_off);
+			long var_size;
+
+			/* static variables are not exposed through BPF skeleton */
+			if (btf_var(var)->linkage == BTF_VAR_STATIC)
+				continue;
+
+			var_size = btf__resolve_size(btf, var->type);
+			if (var_size < 0)
+				continue;
+
+			var_ident[0] = '\0';
+			strncat(var_ident, var_name, sizeof(var_ident) - 1);
+			sanitize_identifier(var_ident);
+
+			printf("\t_Static_assert(sizeof(s->%s->%s) == %ld, \"unexpected size of '%s'\");\n",
+			       map_ident, var_ident, var_size, var_ident);
+		}
+	}
+	codegen("\
+		\n\
+		#ifdef __cplusplus					    \n\
+		#undef _Static_assert					    \n\
+		#endif							    \n\
+		}							    \n\
+		");
+}
+
+static void codegen_attach_detach(struct bpf_object *obj, const char *obj_name)
+{
+	struct bpf_program *prog;
+
+	bpf_object__for_each_program(prog, obj) {
+		const char *tp_name;
+
+		codegen("\
+			\n\
+			\n\
+			static inline int					    \n\
+			%1$s__%2$s__attach(struct %1$s *skel)			    \n\
+			{							    \n\
+				int prog_fd = skel->progs.%2$s.prog_fd;		    \n\
+			", obj_name, bpf_program__name(prog));
+
+		switch (bpf_program__type(prog)) {
+		case BPF_PROG_TYPE_RAW_TRACEPOINT:
+			tp_name = strchr(bpf_program__section_name(prog), '/') + 1;
+			printf("\tint fd = skel_raw_tracepoint_open(\"%s\", prog_fd);\n", tp_name);
+			break;
+		case BPF_PROG_TYPE_TRACING:
+		case BPF_PROG_TYPE_LSM:
+			if (bpf_program__expected_attach_type(prog) == BPF_TRACE_ITER)
+				printf("\tint fd = skel_link_create(prog_fd, 0, BPF_TRACE_ITER);\n");
+			else
+				printf("\tint fd = skel_raw_tracepoint_open(NULL, prog_fd);\n");
+			break;
+		default:
+			printf("\tint fd = ((void)prog_fd, 0); /* auto-attach not supported */\n");
+			break;
+		}
+		codegen("\
+			\n\
+										    \n\
+				if (fd > 0)					    \n\
+					skel->links.%1$s_fd = fd;		    \n\
+				return fd;					    \n\
+			}							    \n\
+			", bpf_program__name(prog));
+	}
+
+	codegen("\
+		\n\
+									    \n\
+		static inline int					    \n\
+		%1$s__attach(struct %1$s *skel)				    \n\
+		{							    \n\
+			int ret = 0;					    \n\
+									    \n\
+		", obj_name);
+
+	bpf_object__for_each_program(prog, obj) {
+		codegen("\
+			\n\
+				ret = ret < 0 ? ret : %1$s__%2$s__attach(skel);   \n\
+			", obj_name, bpf_program__name(prog));
+	}
+
+	codegen("\
+		\n\
+			return ret < 0 ? ret : 0;			    \n\
+		}							    \n\
+									    \n\
+		static inline void					    \n\
+		%1$s__detach(struct %1$s *skel)				    \n\
+		{							    \n\
+		", obj_name);
+
+	bpf_object__for_each_program(prog, obj) {
+		codegen("\
+			\n\
+				skel_closenz(skel->links.%1$s_fd);	    \n\
+			", bpf_program__name(prog));
+	}
+
+	codegen("\
+		\n\
+		}							    \n\
+		");
+}
+
+static void codegen_destroy(struct bpf_object *obj, const char *obj_name)
+{
+	struct bpf_program *prog;
+	struct bpf_map *map;
+	char ident[256];
+
+	codegen("\
+		\n\
+		static void						    \n\
+		%1$s__destroy(struct %1$s *skel)			    \n\
+		{							    \n\
+			if (!skel)					    \n\
+				return;					    \n\
+			%1$s__detach(skel);				    \n\
+		",
+		obj_name);
+
+	bpf_object__for_each_program(prog, obj) {
+		codegen("\
+			\n\
+				skel_closenz(skel->progs.%1$s.prog_fd);	    \n\
+			", bpf_program__name(prog));
+	}
+
+	bpf_object__for_each_map(map, obj) {
+		if (!get_map_ident(map, ident, sizeof(ident)))
+			continue;
+		if (bpf_map__is_internal(map) &&
+		    (bpf_map__map_flags(map) & BPF_F_MMAPABLE))
+			printf("\tskel_free_map_data(skel->%1$s, skel->maps.%1$s.initial_value, %2$zd);\n",
+			       ident, bpf_map_mmap_sz(map));
+		codegen("\
+			\n\
+				skel_closenz(skel->maps.%1$s.map_fd);	    \n\
+			", ident);
+	}
+	codegen("\
+		\n\
+			skel_free(skel);				    \n\
+		}							    \n\
+		",
+		obj_name);
 }
 
 /**
@@ -433,6 +730,11 @@ static int do_skeleton(int argc, char **argv)
 	}
 
 	btf = bpf_object__btf(obj);
+	if (btf) {
+		err = codegen_datasecs(obj, obj_name);
+		if (err)
+			goto out;
+	}
 out:
 	return err;
 }
