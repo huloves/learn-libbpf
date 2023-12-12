@@ -55,6 +55,7 @@ __s32 btf__find_by_name_kind(const struct btf *btf,
 					const char *type_name, __u32 kind);
 __u32 btf__type_cnt(const struct btf *btf);
 const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+size_t btf__pointer_size(const struct btf *btf);
 int btf__set_pointer_size(struct btf *btf, size_t ptr_sz);
 __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
 int btf__resolve_type(const struct btf *btf, __u32 type_id);
@@ -106,6 +107,13 @@ struct btf_dump_opts {
 
 typedef void (*btf_dump_printf_fn_t)(void *ctx, const char *fmt, va_list args);
 
+struct btf_dump *btf_dump__new(const struct btf *btf,
+					  btf_dump_printf_fn_t printf_fn,
+					  void *ctx,
+					  const struct btf_dump_opts *opts);
+
+void btf_dump__free(struct btf_dump *d);
+
 struct btf_dump_emit_type_decl_opts {
 	/* size of this struct, for forward/backward compatiblity */
 	size_t sz;
@@ -126,6 +134,24 @@ struct btf_dump_emit_type_decl_opts {
 	size_t :0;
 };
 #define btf_dump_emit_type_decl_opts__last_field strip_mods
+
+struct btf_dump_type_data_opts {
+	/* size of this struct, for forward/backward compatibility */
+	size_t sz;
+	const char *indent_str;
+	int indent_level;
+	/* below match "show" flags for bpf_show_snprintf() */
+	bool compact;		/* no newlines/indentation */
+	bool skip_names;	/* skip member/type names */
+	bool emit_zeroes;	/* show 0-valued fields */
+	size_t :0;
+};
+#define btf_dump_type_data_opts__last_field emit_zeroes
+
+int
+btf_dump__dump_type_data(struct btf_dump *d, __u32 id,
+			 const void *data, size_t data_sz,
+			 const struct btf_dump_type_data_opts *opts);
 
 /*
  * A set of helpers for easier BTF types handling.
