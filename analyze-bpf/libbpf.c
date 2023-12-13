@@ -757,7 +757,7 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 			return -ENOTSUP;
 		}
 
-		printf("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
+		pr_debug("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
 			 sec_name, name, sec_off / BPF_INSN_SZ, sec_off, prog_sz / BPF_INSN_SZ, prog_sz);
 		
 		/**
@@ -1390,7 +1390,7 @@ bpf_object__init_license(struct bpf_object *obj, void *data, size_t size)
 	 * go over allowed ELF data section buffer
 	 */
 	libbpf_strlcpy(obj->license, data, min(size + 1, sizeof(obj->license)));
-	printf("license of %s is %s\n", obj->path, obj->license);
+	pr_debug("license of %s is %s\n", obj->path, obj->license);
 	return 0;
 }
 
@@ -1642,7 +1642,7 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	if (map_is_mmapable(obj, map))
 		def->map_flags |= BPF_F_MMAPABLE;
 
-	printf("map '%s' (global data): at sec_idx %d, offset %zu, flags %x.\n",
+	pr_debug("map '%s' (global data): at sec_idx %d, offset %zu, flags %x.\n",
 		 map->name, map->sec_idx, map->sec_offset, def->map_flags);
 
 	mmap_sz = bpf_map_mmap_sz(map->def.value_size, map->def.max_entries);
@@ -1651,7 +1651,7 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	if (map->mmaped == MAP_FAILED) {
 		err = -errno;
 		map->mmaped = NULL;
-		printf("failed to alloc map '%s' content buffer: %d\n",
+		pr_warn("failed to alloc map '%s' content buffer: %d\n",
 			map->name, err);
 		zfree(&map->real_name);
 		zfree(&map->name);
@@ -1661,7 +1661,7 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	if (data)
 		memcpy(map->mmaped, data, data_sz);
 
-	printf("map %td is \"%s\"\n", map - obj->maps, map->name);
+	pr_debug("map %td is \"%s\"\n", map - obj->maps, map->name);
 	return 0;
 }
 
@@ -2527,7 +2527,7 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 		if (!data)
 			return -LIBBPF_ERRNO__FORMAT;
 
-		printf("elf: section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
+		pr_debug("elf: section(%d) %s, size %ld, link %d, flags %lx, type=%d\n",
 			 idx, name, (unsigned long)data->d_size,
 			 (int)sh->sh_link, (unsigned long)sh->sh_flags,
 			 (int)sh->sh_type);
@@ -2581,7 +2581,7 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 				obj->efile.st_ops_link_data = data;
 				obj->efile.st_ops_link_shndx = idx;
 			} else {
-				printf("elf: skipping unrecognized data section(%d) %s\n",
+				pr_debug("elf: skipping unrecognized data section(%d) %s\n",
 					idx, name);
 			}
 		} else if (sh->sh_type == SHT_REL) {
@@ -2611,7 +2611,7 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			sec_desc->shdr = sh;
 			sec_desc->data = data;
 		} else {
-			printf("elf: skipping section(%d) %s (size %zu)\n", idx, name,
+			pr_debug("elf: skipping section(%d) %s (size %zu)\n", idx, name,
 				(size_t)sh->sh_size);
 		}
 	}
@@ -2861,7 +2861,7 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 		return dummy_var_btf_id;
 	
 	n = sh->sh_size / sh->sh_entsize;
-	printf("looking for externs among %d symbols...\n", n);
+	pr_debug("looking for externs among %d symbols...\n", n);
 
 	for (i = 0; i < n; i++) {
 		Elf64_Sym *sym = elf_sym_by_idx(obj, i);
@@ -2947,7 +2947,7 @@ static int bpf_object__collect_externs(struct bpf_object *obj)
 			return -ENOTSUP;
 		}
 	}
-	printf("collected %d externs total\n", obj->nr_extern);
+	pr_debug("collected %d externs total\n", obj->nr_extern);
 
 	if (!obj->nr_extern)
 		return 0;
@@ -3552,34 +3552,34 @@ static void fill_map_from_def(struct bpf_map *map, const struct btf_map_def *def
 		map->def.max_entries = adjust_ringbuf_sz(map->def.max_entries);
 
 	if (def->parts & MAP_DEF_MAP_TYPE)
-		printf("map '%s': found type = %u.\n", map->name, def->map_type);
+		pr_debug("map '%s': found type = %u.\n", map->name, def->map_type);
 
 	if (def->parts & MAP_DEF_KEY_TYPE)
-		printf("map '%s': found key [%u], sz = %u.\n",
+		pr_debug("map '%s': found key [%u], sz = %u.\n",
 			 map->name, def->key_type_id, def->key_size);
 	else if (def->parts & MAP_DEF_KEY_SIZE)
-		printf("map '%s': found key_size = %u.\n", map->name, def->key_size);
+		pr_debug("map '%s': found key_size = %u.\n", map->name, def->key_size);
 
 	if (def->parts & MAP_DEF_VALUE_TYPE)
-		printf("map '%s': found value [%u], sz = %u.\n",
+		pr_debug("map '%s': found value [%u], sz = %u.\n",
 			 map->name, def->value_type_id, def->value_size);
 	else if (def->parts & MAP_DEF_VALUE_SIZE)
-		printf("map '%s': found value_size = %u.\n", map->name, def->value_size);
+		pr_debug("map '%s': found value_size = %u.\n", map->name, def->value_size);
 
 	if (def->parts & MAP_DEF_MAX_ENTRIES)
-		printf("map '%s': found max_entries = %u.\n", map->name, def->max_entries);
+		pr_debug("map '%s': found max_entries = %u.\n", map->name, def->max_entries);
 	if (def->parts & MAP_DEF_MAP_FLAGS)
-		printf("map '%s': found map_flags = 0x%x.\n", map->name, def->map_flags);
+		pr_debug("map '%s': found map_flags = 0x%x.\n", map->name, def->map_flags);
 	if (def->parts & MAP_DEF_MAP_EXTRA)
-		printf("map '%s': found map_extra = 0x%llx.\n", map->name,
+		pr_debug("map '%s': found map_extra = 0x%llx.\n", map->name,
 			 (unsigned long long)def->map_extra);
 	if (def->parts & MAP_DEF_PINNING)
-		printf("map '%s': found pinning = %u.\n", map->name, def->pinning);
+		pr_debug("map '%s': found pinning = %u.\n", map->name, def->pinning);
 	if (def->parts & MAP_DEF_NUMA_NODE)
-		printf("map '%s': found numa_node = %u.\n", map->name, def->numa_node);
+		pr_debug("map '%s': found numa_node = %u.\n", map->name, def->numa_node);
 
 	if (def->parts & MAP_DEF_INNER_MAP)
-		printf("map '%s': found inner map definition.\n", map->name);
+		pr_debug("map '%s': found inner map definition.\n", map->name);
 }
 
 static const char *btf_var_linkage_str(__u32 linkage)
@@ -3654,7 +3654,7 @@ static int bpf_object__init_user_btf_map(struct bpf_object *obj,
 	map->sec_idx = sec_idx;
 	map->sec_offset = vi->offset;
 	map->btf_var_idx = var_idx;
-	printf("map '%s': at sec_idx %d, offset %zu.\n",
+	pr_debug("map '%s': at sec_idx %d, offset %zu.\n",
 		 map_name, map->sec_idx, map->sec_offset);
 
 	err = parse_btf_map_def(map->name, obj->btf, def, strict, &map_def, &inner_def);
@@ -3894,13 +3894,13 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 			    map->sec_idx != sym->st_shndx ||
 			    map->sec_offset != sym->st_value)
 				continue;
-			printf("prog '%s': found map %zd (%s, sec %d, off %zu) for insn #%u\n",
+			pr_debug("prog '%s': found map %zd (%s, sec %d, off %zu) for insn #%u\n",
 				 prog->name, map_idx, map->name, map->sec_idx,
 				 map->sec_offset, insn_idx);
 			break;
 		}
 		if (map_idx >= nr_maps) {
-			printf("prog '%s': map relo failed to find map for section '%s', off %zu\n",
+			pr_warn("prog '%s': map relo failed to find map for section '%s', off %zu\n",
 				prog->name, sym_sec_name, (size_t)sym->st_value);
 			return -LIBBPF_ERRNO__RELOC;
 		}
@@ -3921,7 +3921,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		map = &obj->maps[map_idx];
 		if (map->libbpf_type != type || map->sec_idx != sym->st_shndx)
 			continue;
-		printf("prog '%s': found data map %zd (%s, sec %d, off %zu) for insn %u\n",
+		pr_debug("prog '%s': found data map %zd (%s, sec %d, off %zu) for insn %u\n",
 			 prog->name, map_idx, map->name, map->sec_idx,
 			 map->sec_offset, insn_idx);
 		break;
@@ -3999,7 +3999,7 @@ bpf_object__collect_prog_relos(struct bpf_object *obj, Elf64_Shdr *shdr, Elf_Dat
 	if (!relo_sec_name || !sec_name)
 		return -EINVAL;
 
-	printf("sec '%s': collecting relocation for section(%zu) '%s'\n",
+	pr_debug("sec '%s': collecting relocation for section(%zu) '%s'\n",
 		 relo_sec_name, sec_idx, sec_name);
 	nrels = shdr->sh_size / shdr->sh_entsize;
 
@@ -4043,7 +4043,7 @@ bpf_object__collect_prog_relos(struct bpf_object *obj, Elf64_Shdr *shdr, Elf_Dat
 			sym_name = elf_sym_str(obj, sym->st_name);
 		sym_name = sym_name ?: "<?";
 
-		printf("sec '%s': relo #%d: insn #%u against '%s'\n",
+		pr_debug("sec '%s': relo #%d: insn #%u against '%s'\n",
 			 relo_sec_name, i, insn_idx, sym_name);
 
 		prog = find_prog_by_sec_insn(obj, sec_idx, insn_idx);
@@ -4135,7 +4135,7 @@ static int bpf_object_init_progs(struct bpf_object *obj, const struct bpf_object
 		prog->sec_def = find_sec_def(prog->sec_name);
 		if (!prog->sec_def) {
 			/* couldn't guess, but user might manually specify */
-			printf("prog '%s': unrecognized ELF section name '%s'\n",
+			pr_debug("prog '%s': unrecognized ELF section name '%s'\n",
 				prog->name, prog->sec_name);
 			continue;
 		}
@@ -4363,7 +4363,7 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 				 (unsigned long)obj_buf_sz);
 		}
 		path = obj_name;
-		printf("loading object '%s' from buffer\n", obj_name);
+		pr_debug("loading object '%s' from buffer\n", obj_name);
 	}
 
 	log_buf = OPTS_GET(opts, kernel_log_buf, NULL);

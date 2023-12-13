@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <libelf.h>
+
+#include "libbpf.h"
 #include "btf.h"
 
 #include "include/uapi/linux/btf.h"
@@ -74,6 +76,19 @@ static inline bool str_has_sfx(const char *str, const char *sfx)
 		return false;
 	return strcmp(str + str_len - sfx_len, sfx) == 0;
 }
+
+extern void libbpf_print(enum libbpf_print_level level,
+			 const char *format, ...)
+	__attribute__((format(printf, 2, 3)));
+
+#define __pr(level, fmt, ...)	\
+do {				\
+	libbpf_print(level, "libbpf: " fmt, ##__VA_ARGS__);	\
+} while (0)
+
+#define pr_warn(fmt, ...)	__pr(LIBBPF_WARN, fmt, ##__VA_ARGS__)
+#define pr_info(fmt, ...)	__pr(LIBBPF_INFO, fmt, ##__VA_ARGS__)
+#define pr_debug(fmt, ...)	__pr(LIBBPF_DEBUG, fmt, ##__VA_ARGS__)
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0

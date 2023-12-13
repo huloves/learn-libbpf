@@ -41,6 +41,16 @@ enum libbpf_print_level {
 typedef int (*libbpf_print_fn_t)(enum libbpf_print_level level,
 				 const char *, va_list ap);
 
+/**
+ * @brief **libbpf_set_print()** sets user-provided log callback function to
+ * be used for libbpf warnings and informational messages.
+ * @param fn The log print function. If NULL, libbpf won't print anything.
+ * @return Pointer to old print function.
+ *
+ * This function is thread-safe.
+ */
+libbpf_print_fn_t libbpf_set_print(libbpf_print_fn_t fn);
+
 /* Hide internal to user */
 struct bpf_object;
 

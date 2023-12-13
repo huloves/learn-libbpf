@@ -9,6 +9,7 @@
 #include <sys/utsname.h>
 #include <sys/stat.h>
 
+#include "libbpf_internal.h"
 #include "bpf_helpers.h"
 
 #include "include/uapi/linux/btf.h"
@@ -42,7 +43,7 @@ static __u32 get_ubuntu_kernel_version(void)
 	if (ret != 3)
 		return 0;
 
-	printf("ubuntu_kernel_version: %d.%d.%d\n", major, minor, patch);
+	pr_debug("ubuntu_kernel_version: %d.%d.%d\n", major, minor, patch);
 
 	return KERNEL_VERSION(major, minor, patch);
 }
