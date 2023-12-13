@@ -1,8 +1,8 @@
 # analyze-bpftool
 BUILD_DIR = ./build
 INCLUDE := -Iinclude/ -Iinclude/uapi/
-INCLUDE_BPFTOOL := -Ibpftool/include/
-INCLUDE_LIBBPF := -Iinclude/ -Iinclude/uapi/
+INCLUDE_BPFTOOL := -Ibpftool/include/ -g
+INCLUDE_LIBBPF := -Iinclude/ -Iinclude/uapi/ -g
 
 OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/linker.o $(BUILD_DIR)/hashmap.o $(BUILD_DIR)/strset.o \
 	$(BUILD_DIR)/btf.o $(BUILD_DIR)/libbpf.o $(BUILD_DIR)/gen.o $(BUILD_DIR)/usdt.o

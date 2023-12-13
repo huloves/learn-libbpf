@@ -723,6 +723,11 @@ bpf_object__add_programs(struct bpf_object *obj, Elf_Data *sec_data,
 		 */
 		sym = elf_sym_by_idx(obj, i);
 		/**
+		 * 符号若不属于该section，跳过
+		 */
+		if (sym->st_shndx != sec_idx)
+			continue;
+		/**
 		 * 符号若不是code object，跳过
 		 */
 		if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC)
@@ -1165,6 +1170,13 @@ static int bpf_object_init_struct_ops(struct bpf_object *obj)
 	return err;
 }
 
+/**
+ * bpf_object__new - 创建一个bpf_object
+ * @path: bpf程序路径
+ * @obj_buf: 保存有bpf程序的内存缓冲区
+ * @obj_buf_sz: obj_buf的大小
+ * @obj_name: obj_object的名字
+ */
 static struct bpf_object *bpf_object__new(const char *path,
 					  const void *obj_buf,
 					  size_t obj_buf_sz,
@@ -1173,12 +1185,19 @@ static struct bpf_object *bpf_object__new(const char *path,
 	struct bpf_object *obj;
 	char *end;
 
+	/**
+	 * 申请一个bpf_object对象，bpf_objdect对象尾部保存有该bpf程序的路径，该路径可以为空
+	 */
 	obj = calloc(1, sizeof(struct bpf_object) + strlen(path) + 1);
 	if (!obj) {
 		printf("alloc memory failed for %s\n", path);
 		return ERR_PTR(-ENOMEM);
 	}
 
+	/**
+	 * 拷贝路径名，bpf_object对象名
+	 * 若bpf_object对象名为空，则根据path生成一个名字
+	 */
 	strcpy(obj->path, path);
 	if (obj_name) {
 		libbpf_strlcpy(obj->name, obj_name, sizeof(obj->name));
@@ -1190,6 +1209,9 @@ static struct bpf_object *bpf_object__new(const char *path,
 			*end = 0;
 	}
 
+	/**
+	 * 初始化elf文件相关信息
+	 */
 	obj->efile.fd = -1;
 	/**
 	 * Caller of this function should also call
@@ -1197,15 +1219,15 @@ static struct bpf_object *bpf_object__new(const char *path,
 	 * obj_buf to user. if not, we should duplicate the buffer to
 	 * avoid user freeing them before elf finish.
 	 */
-	obj->efile.obj_buf = obj_buf;
-	obj->efile.obj_buf_sz = obj_buf_sz;
-	obj->efile.btf_maps_shndx = -1;
+	obj->efile.obj_buf = obj_buf;   // 记录elf文件在内存中的二进制内容
+	obj->efile.obj_buf_sz = obj_buf_sz;   // 记录obj_buf的大小
+	obj->efile.btf_maps_shndx = -1;   // 初始化btf maps所在的section
 	obj->efile.st_ops_shndx = -1;
 	obj->efile.st_ops_link_shndx = -1;
 	obj->kconfig_map_idx = -1;
 
-	obj->kern_version = get_kernel_version();
-	obj->loaded = false;
+	obj->kern_version = get_kernel_version();   // 记录内核版本
+	obj->loaded = false;   // 初始化加载状态
 
 	return obj;
 }
@@ -1230,6 +1252,11 @@ static void bpf_object__elf_finish(struct bpf_object *obj)
 
 /**
  * bpf_object__elf_init - 初始化obj->efile结构中与ELF相关的内容并进行检查
+ * 1. 根据obj_buf创建ELF对象
+ * 2. obj->efile.elf中记录创建的ELF对象
+ * 3. obj->efile.ehdr记录ELF header
+ * 4. obj->efile.shstrndx记录section header string table的section索引
+ * 5. 做一些必要的检查
  */
 static int bpf_object__elf_init(struct bpf_object *obj)
 {
@@ -1242,6 +1269,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 		return -LIBBPF_ERRNO__LIBELF;
 	}
 	
+	/**
+	 * 创建一个ELF对象
+	 */
 	if (obj->efile.obj_buf_sz > 0) {
 		/* obj_buf should have been validated by bpf_object__open_mem(). */
 		elf = elf_memory((char *)obj->efile.obj_buf, obj->efile.obj_buf_sz);
@@ -1265,6 +1295,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 		goto errout;
 	}
 
+	/**
+	 * obj中记录创建的ELF对象
+	 */
 	obj->efile.elf = elf;
 
 	if (elf_kind(elf) != ELF_K_ELF) {
@@ -1279,6 +1312,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 		goto errout;
 	}
 
+	/**
+	 * 记录ELF header
+	 */
 	obj->efile.ehdr = ehdr = elf64_getehdr(elf);
 	if (!obj->efile.ehdr) {
 		printf("elf: failed to get ELF header from %s: %s\n", obj->path, elf_errmsg(-1));
@@ -1286,6 +1322,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 		goto errout;
 	}
 
+	/**
+	 * 获取并记录section header string table的section索引
+	 */
 	if (elf_getshdrstrndx(elf, &obj->efile.shstrndx)) {
 		printf("elf: failed to get section names section index for %s: %s\n",
 			obj->path, elf_errmsg(-1));
@@ -1294,6 +1333,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 	}
 
 	/* ELF is corrupted/truncated, avoid calling elf_strptr. */
+	/**
+	 * 检查section header string table是否为空，为空返回错误
+	 */
 	if (!elf_rawdata(elf_getscn(elf, obj->efile.shstrndx), NULL)) {
 		printf("elf: failed to get section names strings from %s: %s\n",
 			obj->path, elf_errmsg(-1));
@@ -1302,6 +1344,9 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 	}
 
 	/* Old LLVM set e_machine to EM_NONE */
+	/**
+	 * 检查ELF文件类型是否为可重定位文件，并且e_machine是否为EM_BPF
+	 */
 	if (ehdr->e_type != ET_REL || (ehdr->e_machine && ehdr->e_machine != EM_BPF)) {
 		printf("elf: %s is not a valid eBPF object file\n", obj->path);
 		err = -LIBBPF_ERRNO__FORMAT;
@@ -1314,6 +1359,11 @@ errout:
 	return err;
 }
 
+/**
+ * bpf_object__check_endianness - 检查字节顺序
+ * 检查通过返回0
+ * 检查不通过返回-LIBBPF_ERRNO__ENDIAN
+ */
 static int bpf_object__check_endianness(struct bpf_object *obj)
 {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -2398,19 +2448,27 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 	 * include sec #0, it is already the necessary size of an array to keep
 	 * all the sections.
 	 */
+	/**
+	 * ELF section的索引从0开始，但节#0是特殊的“无效”节。
+	 * 由于elf_getshdrnum()返回的节计数包括了节#0，
+	 * 因此，它已经是一个足够大的数组来保存所有的节。
+	 */
 	if (elf_getshdrnum(obj->efile.elf, &obj->efile.sec_cnt)) {
 		printf("elf: failed to get the number of sections for %s: %s\n",
 			obj->path, elf_errmsg(-1));
 		return -LIBBPF_ERRNO__FORMAT;
 	}
+	/**
+	 * 分配obj->efile.sec_cnt个struct elf_sec_desc结构
+	 */
 	obj->efile.secs = calloc(obj->efile.sec_cnt, sizeof(*obj->efile.secs));
 	if (!obj->efile.secs)
 		return -ENOMEM;
 
-	/* a bunch of elf parsing functionality depends on processing symbols,
-	 * so do the first pass and find the symbol table
-	 */
 	/**
+	 * a bunch of elf parsing functionality depends on processing symbols,
+	 * so do the first pass and find the symbol table
+	 * 许多ELF解析功能依赖于处理符号，因此进行第一次遍历，找到符号表。
 	 * 遍历每一个seciton，找到符号表(symbol table)
 	 */
 	scn = NULL;
@@ -2434,12 +2492,15 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 
 			idx = elf_ndxscn(scn);
 
-			obj->efile.symbols = data;
-			obj->efile.symbols_shndx = idx;
-			obj->efile.strtabidx = sh->sh_link;
+			obj->efile.symbols = data;   // 符号表数据
+			obj->efile.symbols_shndx = idx;   // 符号表索引
+			obj->efile.strtabidx = sh->sh_link;   // 符号表使用的字符串表索引
 		}
 	}
 
+	/**
+	 * 检查是否获得了符号表数据
+	 */
 	if (!obj->efile.symbols) {
 		printf("elf: couldn't find symbol table in %s, stripped object file?\n",
 			obj->path);
@@ -4313,10 +4374,16 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 	if (log_size && !log_buf)
 		return ERR_PTR(-EINVAL);
 	
+	/**
+	 * 创建并初始化一个bpf_object对象
+	 */
 	obj = bpf_object__new(path, obj_buf, obj_buf_sz, obj_name);
 	if (IS_ERR(obj))
 		return obj;
 
+	/**
+	 * 初始化log相关内容
+	 */
 	obj->log_buf = log_buf;
 	obj->log_size = log_size;
 	obj->log_level = log_level;
@@ -4939,6 +5006,9 @@ static int find_btf_by_prefix_kind(const struct btf *btf, const char *prefix,
 	return btf__find_by_name_kind(btf, btf_type_name, kind);
 }
 
+/**
+ * __bpf_map_iter - 在obj->maps中，返回从m开始之后的第i个map
+ */
 static struct bpf_map *
 __bpf_map__iter(const struct bpf_map *m, const struct bpf_object *obj, int i)
 {
@@ -4948,15 +5018,24 @@ __bpf_map__iter(const struct bpf_map *m, const struct bpf_object *obj, int i)
 	if (!obj || !obj->maps)
 		return errno = EINVAL, NULL;
 
+	/**
+	 * 获取maps起始地址和结束地址
+	 */
 	s = obj->maps;
 	e = obj->maps + obj->nr_maps;
 
+	/**
+	 * 若m不在maps地址范围内，保存错误码并返回NULL
+	 */
 	if ((m < s) || (m >= e)) {
 		printf("error in %s: map handler doesn't belong to object\n",
 			 __func__);
 		return errno = EINVAL, NULL;
 	}
 
+	/**
+	 * 计算目标map的索引，并返回目标map地址
+	 */
 	idx = (m - obj->maps) + i;
 	if (idx >= obj->nr_maps || idx < 0)
 		return NULL;
@@ -4966,9 +5045,15 @@ __bpf_map__iter(const struct bpf_map *m, const struct bpf_object *obj, int i)
 struct bpf_map *
 bpf_object__next_map(const struct bpf_object *obj, const struct bpf_map *prev)
 {
+	/**
+	 * prev为NULL，返回maps首地址
+	 */
 	if (prev == NULL)
 		return obj->maps;
 
+	/**
+	 * 返回prev的下一个map
+	 */
 	return __bpf_map__iter(prev, obj, 1);
 }
 

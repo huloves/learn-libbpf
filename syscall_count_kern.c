@@ -1,5 +1,5 @@
 #include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
+#include <bpf_helpers.h>
 
 // 大小为1的数组，用于存放计数值
 struct {
