@@ -2431,6 +2431,9 @@ static int cmp_progs(const void *_a, const void *_b)
 	return a->sec_insn_off < b->sec_insn_off ? -1 : 1;
 }
 
+/**
+ * bpf_object__elf_collect - 收集ELF信息
+ */
 static int bpf_object__elf_collect(struct bpf_object *obj)
 {
 	struct elf_sec_desc *sec_desc;
@@ -2509,20 +2512,26 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 
 	scn = NULL;
 	while ((scn = elf_nextscn(elf, scn)) != NULL) {
+		/* 获取section索引 */
 		idx = elf_ndxscn(scn);
+		/* 记录要初始化的section描述符 */
 		sec_desc = &obj->efile.secs[idx];
 
+		/* 获取section header */
 		sh = elf_sec_hdr(obj, scn);
 		if (!sh)
 			return -LIBBPF_ERRNO__FORMAT;
 
+		/* 通过section name索引获得section name */
 		name = elf_sec_str(obj, sh->sh_name);
 		if (!name)
 			return -LIBBPF_ERRNO__FORMAT;
 
+		/* 跳过需要忽略的section */
 		if (ignore_elf_section(sh, name))
 			continue;
 		
+		/* 获取section的data区域 */
 		data = elf_sec_data(obj, scn);
 		if (!data)
 			return -LIBBPF_ERRNO__FORMAT;
@@ -2544,7 +2553,7 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			return -ENOTSUP;
 		} else if (strcmp(name, MAPS_ELF_SEC) == 0) {
 			/**
-			 * 记录btf_maps段的索引
+			 * 记录btf_maps section的索引
 			 */
 			obj->efile.btf_maps_shndx = idx;
 		} else if (strcmp(name, BTF_ELF_SEC) == 0) {
@@ -2554,6 +2563,12 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			 * 记录btf section的数据
 			 */
 			btf_data = data;
+		} else if (strcmp(name, BTF_EXT_ELF_SEC) == 0) {
+			if (sh->sh_type != SHT_PROGBITS)
+				return -LIBBPF_ERRNO__FORMAT;
+			btf_ext_data = data;
+		} else if (sh->sh_type == SHT_SYMTAB) {
+			/* already processed during the first pass above */
 		} else if (sh->sh_type == SHT_PROGBITS && data->d_size > 0) {
 			if (sh->sh_flags & SHF_EXECINSTR) {
 				/**
@@ -2566,11 +2581,13 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 					return err;
 			} else if (strcmp(name, DATA_SEC) == 0 ||
 				   str_has_pfx(name, DATA_SEC ".")) {
+				/* 记录数据段信息: section header and section data */
 				sec_desc->sec_type = SEC_DATA;
 				sec_desc->shdr = sh;
 				sec_desc->data = data;
 			} else if (strcmp(name, RODATA_SEC) == 0 ||
 				   str_has_pfx(name, RODATA_SEC ".")) {
+				/* 记录只读数据段信息: section header and section data */
 				sec_desc->sec_type = SEC_RODATA;
 				sec_desc->shdr = sh;
 				sec_desc->data = data;
