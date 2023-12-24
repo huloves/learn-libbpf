@@ -634,6 +634,9 @@ static int do_skeleton(int argc, char **argv)
 		/* log_level1 + log_level2 + stats, but not stable UAPI */
 		opts.kernel_log_level = 1 + 2 + 4;
 	}
+	/**
+	 * 根据obj_data(目标文件二进制码)生成bpf_object
+	 */
 	obj = bpf_object__open_mem(obj_data, file_sz, &opts);
 	if (!obj) {
 		char err_buf[256];
